@@ -1,0 +1,2647 @@
+"""
+stealth_tpsl.py - Stealth TP/SL Manager for Binance Spot.
+
+Fully manual position entry. NO Binance API connection for monitoring.
+Only connects to Binance to execute market sell when TP/SL is triggered.
+Prices are monitored via public WebSocket (no auth, no API key visible).
+"""
+
+import hashlib
+import hmac
+import json
+import logging
+import os
+import threading
+import time
+from datetime import datetime
+from urllib.parse import urlencode
+
+import requests
+import websocket
+
+from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("stealth_tpsl")
+
+DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+_strategy_cache = {}
+_strategy_cache_ts = 0
+def _get_strategy_map():
+    """Map symbol -> list of port numbers that have live open trades for it. Cached 30s."""
+    import time as _tm, sqlite3 as _sq
+    global _strategy_cache, _strategy_cache_ts
+    now = _tm.time()
+    if _strategy_cache and now - _strategy_cache_ts < 30:
+        return _strategy_cache
+    m = {}
+    for port in [9010, 9011, 9012, 8094, 9000, 9001, 9002, 9003, 7081]:
+        db_path = f"/opt/crypto-paper-{port}/paper_{port}.db"
+        if not os.path.exists(db_path):
+            continue
+        try:
+            c = _sq.connect(db_path)
+            c.row_factory = _sq.Row
+            rows = c.execute("SELECT DISTINCT symbol FROM trades WHERE status='OPEN' AND is_live=1").fetchall()
+            c.close()
+            for r in rows:
+                sym = r["symbol"]
+                if sym not in m:
+                    m[sym] = []
+                m[sym].append(port)
+        except Exception:
+            pass
+    _strategy_cache = m
+    _strategy_cache_ts = now
+    return m
+
+
+
+
+class BinanceExecutor:
+    """Only used for executing sell orders. No monitoring, no account reading."""
+
+    def __init__(self, api_key: str, api_secret: str, rest_url: str = "https://api.binance.com",
+                 api_key_2: str = "", api_secret_2: str = ""):
+        self.api_keys = [(api_key, api_secret)]
+        if api_key_2 and api_secret_2:
+            self.api_keys.append((api_key_2, api_secret_2))
+        self.active_key_idx = 0
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.rest_url = rest_url
+        self._exchange_info_cache = {}
+        self._usdc_pairs = None
+        self._quota_file = "convert_quota.json"
+        self._load_quota()
+        self.buy_mode = 'convert_usdc'
+        self.sell_mode = 'convert_usdc'
+        self._load_trade_modes()
+
+    def _sign(self, params: dict) -> dict:
+        params["timestamp"] = int(time.time() * 1000)
+        query_string = urlencode(params)
+        signature = hmac.new(
+            self.api_secret.encode(), query_string.encode(), hashlib.sha256
+        ).hexdigest()
+        params["signature"] = signature
+        return params
+
+    def _headers(self):
+        return {"X-MBX-APIKEY": self.api_key}
+
+    def _switch_api_key(self) -> bool:
+        if len(self.api_keys) <= 1:
+            return False
+        next_idx = (self.active_key_idx + 1) % len(self.api_keys)
+        if next_idx == getattr(self, '_first_quota_key', -1):
+            logger.error(f"All {len(self.api_keys)} API keys have hit quota limit")
+            return False
+        if not hasattr(self, '_first_quota_key') or self._first_quota_key == -1:
+            self._first_quota_key = self.active_key_idx
+        self.active_key_idx = next_idx
+        self.api_key, self.api_secret = self.api_keys[self.active_key_idx]
+        logger.info(f"SWITCHED to API key #{self.active_key_idx + 1}")
+        return True
+
+    def _reset_quota_tracking(self):
+        self._first_quota_key = -1
+
+    def _load_quota(self):
+        try:
+            import json as _j
+            with open(self._quota_file, "r") as f:
+                d = _j.load(f)
+            today = time.strftime("%Y-%m-%d", time.gmtime())
+            if d.get("date") == today:
+                self._quota_calls_today = d.get("calls", 0)
+                self._quota_limit = d.get("limit", 0)
+                self._quota_exhausted = d.get("exhausted", False)
+                self._quota_date = today
+            else:
+                self._quota_calls_today = 0
+                self._quota_date = today
+                self._quota_limit = d.get("limit", 0)
+                self._quota_exhausted = False
+        except Exception:
+            self._quota_calls_today = 0
+            self._quota_date = time.strftime("%Y-%m-%d", time.gmtime())
+            self._quota_limit = 0
+            self._quota_exhausted = False
+
+    def _save_quota(self):
+        try:
+            import json as _j
+            with open(self._quota_file, "w") as f:
+                _j.dump({"date": self._quota_date, "calls": self._quota_calls_today,
+                         "limit": self._quota_limit, "exhausted": self._quota_exhausted}, f)
+        except Exception:
+            pass
+
+    def _load_trade_modes(self):
+        try:
+            import json as _j
+            import os as _os
+            p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'trade_modes.json')
+            with open(p, 'r') as f:
+                d = _j.load(f)
+                self.buy_mode = d.get('buy_mode', 'convert_usdc')
+                self.sell_mode = d.get('sell_mode', 'convert_usdc')
+        except Exception:
+            self.buy_mode = 'convert_usdc'
+            self.sell_mode = 'convert_usdc'
+
+    def _save_trade_modes(self):
+        try:
+            import json as _j
+            import os as _os
+            p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'trade_modes.json')
+            with open(p, 'w') as f:
+                _j.dump({'buy_mode': self.buy_mode, 'sell_mode': self.sell_mode}, f)
+        except Exception:
+            pass
+
+    def _track_quota_call(self):
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        if today != self._quota_date:
+            self._quota_calls_today = 0
+            self._quota_date = today
+            self._quota_exhausted = False
+        self._quota_calls_today += 1
+        self._save_quota()
+
+    def get_quota_info(self):
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        if today != self._quota_date:
+            self._quota_calls_today = 0
+            self._quota_date = today
+            self._quota_exhausted = False
+        return {
+            "calls_today": self._quota_calls_today,
+            "limit": self._quota_limit,
+            "exhausted": self._quota_exhausted,
+            "pct": round(self._quota_calls_today / self._quota_limit * 100, 1) if self._quota_limit > 0 else 0,
+            "buy_mode": self.buy_mode,
+            "sell_mode": self.sell_mode
+        }
+
+    def _adjust_quantity(self, symbol: str, quantity: float):
+        if symbol not in self._exchange_info_cache:
+            try:
+                resp = requests.get(f"{self.rest_url}/api/v3/exchangeInfo",
+                                    params={"symbol": symbol}, timeout=10)
+                resp.raise_for_status()
+                for s in resp.json().get("symbols", []):
+                    if s["symbol"] == symbol:
+                        self._exchange_info_cache[symbol] = s
+                        break
+            except Exception as e:
+                logger.error(f"exchangeInfo failed: {e}")
+                return quantity
+
+        info = self._exchange_info_cache.get(symbol)
+        if not info:
+            return quantity
+
+        for f in info.get("filters", []):
+            if f["filterType"] == "LOT_SIZE":
+                step_size = float(f["stepSize"])
+                min_qty = float(f["minQty"])
+                if step_size > 0:
+                    precision = len(f["stepSize"].rstrip("0").split(".")[-1]) if "." in f["stepSize"] else 0
+                    adjusted = round(quantity - (quantity % step_size), precision)
+                    if adjusted < min_qty:
+                        return None
+                    return adjusted
+        return quantity
+
+    def get_balance(self, asset: str):
+        try:
+            params = self._sign({})
+            resp = requests.get(
+                f"{self.rest_url}/api/v3/account",
+                params=params, headers=self._headers(), timeout=10
+            )
+            resp.raise_for_status()
+            for b in resp.json().get("balances", []):
+                if b["asset"] == asset:
+                    return float(b["free"])
+            return 0.0
+        except Exception as e:
+            logger.error(f"Balance check failed for {asset}: {e}")
+            return None
+
+    MAX_CONVERT_EUR = 195.0
+    MIN_CONVERT_EUR = 5.0
+
+    def _single_convert(self, from_asset: str, to_asset: str, quantity: float):
+        """Execute a single Convert API call (getQuote + acceptQuote)."""
+        if from_asset == "EUR":
+            amount_str = f"{quantity:.2f}"
+        else:
+            amount_str = f"{quantity:.8f}".rstrip("0").rstrip(".")
+
+        logger.info(f"CONVERT: {amount_str} {from_asset} -> {to_asset}")
+        try:
+            self._track_quota_call()
+            params = self._sign({
+                "fromAsset": from_asset,
+                "toAsset": to_asset,
+                "fromAmount": amount_str,
+            })
+            resp = requests.post(
+                f"{self.rest_url}/sapi/v1/convert/getQuote",
+                params=params, headers=self._headers(), timeout=10
+            )
+            if resp.status_code != 200:
+                err = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"msg": resp.text}
+                if err.get("code") == 345239 or "quotation limit" in str(err.get("msg", "")).lower():
+                    self._quota_exhausted = True
+                    if self._quota_limit == 0:
+                        self._quota_limit = self._quota_calls_today
+                    self._save_quota()
+                    logger.warning(f"CONVERT: Daily quota limit hit on key #{self.active_key_idx + 1} (calls today: {self._quota_calls_today})")
+                    if self._switch_api_key():
+                        logger.info(f"Retrying with key #{self.active_key_idx + 1}")
+                        return self._single_convert(from_asset, to_asset, quantity)
+                    logger.error(f"CONVERT: All API keys exhausted quota")
+                logger.error(f"CONVERT QUOTE FAILED: {from_asset}->{to_asset} - {err}")
+                return {"error": f"Convert quote failed: {err.get('msg', err)}"}
+            quote = resp.json()
+            quote_id = quote.get("quoteId")
+            ratio = float(quote.get("ratio", 0))
+            to_amount = float(quote.get("toAmount", 0))
+            from_amount = float(quote.get("fromAmount", quantity))
+            logger.info(f"CONVERT QUOTE: {amount_str} {from_asset} -> {to_amount:.4f} {to_asset} (rate {ratio:.10g})")
+
+            if not quote_id:
+                logger.error(f"CONVERT: No quoteId for {amount_str} {from_asset}->{to_asset}. Response: {quote}")
+                return {"error": "No quoteId - amount may exceed Convert limit"}
+
+            params2 = self._sign({"quoteId": quote_id})
+            resp2 = requests.post(
+                f"{self.rest_url}/sapi/v1/convert/acceptQuote",
+                params=params2, headers=self._headers(), timeout=10
+            )
+            if resp2.status_code != 200:
+                err2 = resp2.json() if resp2.headers.get("content-type", "").startswith("application/json") else {"msg": resp2.text}
+                logger.error(f"CONVERT ACCEPT FAILED: {from_asset}->{to_asset} - {err2}")
+                return {"error": f"Convert accept failed: {err2.get('msg', err2)}"}
+            result = resp2.json()
+            logger.info(f"CONVERT FILLED: {from_amount} {from_asset} -> {to_amount:.4f} {to_asset}")
+            return {
+                "order_id": result.get("orderId", quote_id),
+                "from_amount": from_amount,
+                "to_amount": to_amount,
+                "ratio": ratio,
+                "status": "FILLED",
+            }
+        except Exception as e:
+            logger.error(f"CONVERT FAILED: {from_asset}->{to_asset} - {e}")
+            return None
+
+    def _convert(self, from_asset: str, to_asset: str, quantity: float):
+        """Convert with automatic chunking for amounts exceeding EUR limit."""
+        if from_asset == "EUR":
+            estimated_eur = quantity
+        elif to_asset == "EUR":
+            try:
+                symbol = from_asset + "USDT"
+                resp = requests.get(f"{self.rest_url}/api/v3/ticker/price",
+                                    params={"symbol": symbol}, timeout=10)
+                resp.raise_for_status()
+                usdt_price = float(resp.json()["price"])
+                eur_resp = requests.get(f"{self.rest_url}/api/v3/ticker/price",
+                                        params={"symbol": "EURUSDT"}, timeout=10)
+                eur_resp.raise_for_status()
+                eur_rate = float(eur_resp.json()["price"])
+                estimated_eur = quantity * usdt_price / eur_rate
+            except Exception:
+                estimated_eur = self.MAX_CONVERT_EUR + 100
+        else:
+            estimated_eur = self.MAX_CONVERT_EUR + 100
+
+        if estimated_eur <= self.MAX_CONVERT_EUR * 1.2:
+            result = self._single_convert(from_asset, to_asset, quantity)
+            if result is None or result.get("error"):
+                return result
+            return {
+                "order_id": result["order_id"],
+                "filled_qty": result["from_amount"],
+                "filled_quote": result["to_amount"],
+                "avg_price": result.get("ratio", 0),
+                "status": "FILLED",
+                "method": "CONVERT",
+                "to_asset": to_asset
+            }
+
+        if from_asset == "EUR":
+            if quantity > self.MAX_CONVERT_EUR:
+                logger.info(f"BUY: trying full {quantity:.2f} EUR -> {to_asset} in one call")
+                full_result = self._single_convert(from_asset, to_asset, quantity)
+                if full_result is not None and not full_result.get("error"):
+                    logger.info(f"CONVERT COMPLETE: {quantity:.2f} EUR -> {full_result['to_amount']:.4f} {to_asset} (1 call)")
+                    return {
+                        "order_id": full_result["order_id"],
+                        "filled_qty": full_result["from_amount"],
+                        "filled_quote": full_result["to_amount"],
+                        "avg_price": full_result.get("ratio", 0),
+                        "status": "FILLED",
+                        "method": "CONVERT",
+                        "to_asset": to_asset
+                    }
+                logger.info(f"Full amount failed, falling back to chunking at {self.MAX_CONVERT_EUR} EUR")
+            chunks_amount = []
+            remaining = quantity
+            while remaining >= self.MIN_CONVERT_EUR:
+                chunk = min(remaining, self.MAX_CONVERT_EUR)
+                chunks_amount.append(round(chunk, 2))
+                remaining -= chunk
+        else:
+            coins_per_chunk = (self.MAX_CONVERT_EUR / estimated_eur) * quantity * 0.95
+            chunks_amount = []
+            remaining = quantity
+            while remaining > 0:
+                chunk = min(remaining, coins_per_chunk)
+                chunks_amount.append(chunk)
+                remaining -= chunk
+                if remaining < coins_per_chunk * 0.1:
+                    if remaining > 0:
+                        chunks_amount[-1] += remaining
+                    break
+
+        logger.info(f"CONVERT CHUNKED: {len(chunks_amount)} chunks for {quantity} {from_asset} -> {to_asset}")
+
+        total_from = 0.0
+        total_to = 0.0
+        last_order_id = None
+        last_ratio = 0
+
+        for i, chunk_amt in enumerate(chunks_amount):
+            logger.info(f"CONVERT chunk {i+1}/{len(chunks_amount)}: {chunk_amt} {from_asset}")
+            result = None
+            for attempt in range(3):
+                result = self._single_convert(from_asset, to_asset, chunk_amt)
+                if result is not None and not result.get("error"):
+                    break
+                if attempt < 2:
+                    logger.info(f"CONVERT chunk {i+1}: retry {attempt+2}/3 in 2s...")
+                    import time as _time
+                    _time.sleep(2)
+
+            if result is None or result.get("error"):
+                if total_from > 0:
+                    logger.warning(f"Partial convert: {total_from} {from_asset} -> {total_to} {to_asset} ({i}/{len(chunks_amount)} chunks)")
+                    break
+                return result
+
+            total_from += result["from_amount"]
+            total_to += result["to_amount"]
+            last_order_id = result["order_id"]
+            last_ratio = result.get("ratio", 0)
+
+            if i < len(chunks_amount) - 1:
+                time.sleep(0.3)
+
+        logger.info(f"CONVERT COMPLETE: {total_from} {from_asset} -> {total_to} {to_asset} ({len(chunks_amount)} chunks)")
+
+        return {
+            "order_id": last_order_id,
+            "filled_qty": total_from,
+            "filled_quote": total_to,
+            "avg_price": last_ratio,
+            "status": "FILLED",
+            "method": "CONVERT",
+            "to_asset": to_asset
+        }
+
+    def _adjust_quantity(self, symbol: str, quantity: float):
+        try:
+            resp = requests.get(
+                f"{self.rest_url}/api/v3/exchangeInfo",
+                params={"symbol": symbol}, timeout=10
+            )
+            resp.raise_for_status()
+            for s in resp.json().get("symbols", []):
+                if s["symbol"] == symbol:
+                    for f in s.get("filters", []):
+                        if f["filterType"] == "LOT_SIZE":
+                            step_size = float(f["stepSize"])
+                            min_qty = float(f["minQty"])
+                            if step_size > 0:
+                                precision = len(f["stepSize"].rstrip("0").split(".")[-1]) if "." in f["stepSize"] else 0
+                                adjusted = round(quantity - (quantity % step_size), precision)
+                                if adjusted < min_qty:
+                                    return None
+                                return adjusted
+        except Exception as e:
+            logger.error(f"exchangeInfo failed for {symbol}: {e}")
+        return quantity
+
+    def _spot_sell_usdc(self, symbol: str, quantity: float):
+        usdc_symbol = symbol.replace("USDT", "USDC")
+        adjusted = self._adjust_quantity(usdc_symbol, quantity)
+        if adjusted is None:
+            logger.error(f"Cannot adjust quantity for {usdc_symbol}")
+            return {"error": f"Quantity too small for {usdc_symbol}"}
+
+        logger.info(f"USDC SPOT SELL: {adjusted} {usdc_symbol}")
+        try:
+            params = self._sign({
+                "symbol": usdc_symbol,
+                "side": "SELL",
+                "type": "MARKET",
+                "quantity": f"{adjusted}",
+            })
+            resp = requests.post(
+                f"{self.rest_url}/api/v3/order",
+                params=params, headers=self._headers(), timeout=10
+            )
+            if resp.status_code != 200:
+                err = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"msg": resp.text}
+                logger.error(f"USDC SPOT SELL FAILED: {usdc_symbol} - {err}")
+                return {"error": f"USDC spot sell failed: {err.get('msg', err)}"}
+            order = resp.json()
+
+            filled_qty = float(order.get("executedQty", 0))
+            filled_quote = float(order.get("cummulativeQuoteQty", 0))
+            avg_price = filled_quote / filled_qty if filled_qty > 0 else 0
+
+            logger.info(f"USDC SPOT SELL FILLED: {filled_qty} {usdc_symbol} @ {avg_price:.8g} for {filled_quote:.2f} USDC")
+            return {
+                "order_id": order.get("orderId"),
+                "filled_qty": filled_qty,
+                "filled_quote": filled_quote,
+                "avg_price": avg_price,
+                "status": "FILLED",
+                "method": "SPOT_USDC",
+                "to_asset": "USDC",
+            }
+        except Exception as e:
+            logger.error(f"USDC SPOT SELL exception: {usdc_symbol} - {e}")
+            return None
+
+    def _save_alert(self, asset, message, original_error):
+        """Store fallback alerts so dashboard can display them."""
+        import json as _json
+        alert_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sell_alerts.json")
+        alerts = []
+        try:
+            with open(alert_file, "r") as f:
+                alerts = _json.load(f)
+        except Exception:
+            pass
+        alerts.append({
+            "time": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+            "asset": asset,
+            "message": message,
+            "error": str(original_error.get("error", "")) if original_error else ""
+        })
+        alerts = alerts[-50:]
+        with open(alert_file, "w") as f:
+            _json.dump(alerts, f, indent=2)
+
+    def market_sell(self, symbol: str, quantity: float, trade_method: str = None):
+        asset = symbol.replace("USDT", "").replace("USDC", "")
+        if quantity <= 0:
+            logger.error(f"No {asset} available to sell")
+            return None
+
+        # Try USDC Spot first, Convert EUR fallback for selling only
+        if trade_method == "SPOT_USDC":
+            logger.info(f"SELL (USDC-first): {quantity:.8g} {asset} (bought via USDC)")
+            usdc_result = self._spot_sell_usdc(symbol, quantity)
+            if usdc_result is not None and not usdc_result.get("error"):
+                return usdc_result
+            # Fallback to Convert EUR (only if sell mode allows it)
+            if self.sell_mode == 'usdc_only':
+                logger.info(f"SKIP Convert fallback for {asset}: sell mode is USDC-only")
+                return usdc_result
+            if self._quota_exhausted:
+                logger.debug(f"SKIP Convert fallback for {asset}: quota exhausted")
+                self._save_alert(asset, "SELL FAILED: USDC Spot failed, Convert quota exhausted", usdc_result)
+                return usdc_result
+            logger.warning(f"CONVERT FALLBACK: USDC spot sell failed for {asset}, trying Convert EUR")
+            result = self._convert(asset, "EUR", quantity)
+            if result is not None and not result.get("error"):
+                result["alert"] = f"FALLBACK: {asset} sold via Convert EUR (USDC spot failed)"
+                self._save_alert(asset, "USDC Spot sell failed -> sold via Convert EUR", usdc_result)
+                return result
+            logger.error(f"SELL FAILED: {asset} - both USDC Spot and Convert failed")
+            self._save_alert(asset, "TOTAL FAILURE: both USDC Spot AND Convert EUR sell failed", usdc_result)
+            return usdc_result or result
+
+        # Default path: try USDC Spot first, Convert EUR fallback
+        logger.info(f"SELL: {quantity:.8g} {asset}")
+        usdc_result = self._spot_sell_usdc(symbol, quantity)
+        if usdc_result is not None and not usdc_result.get("error"):
+            return usdc_result
+        if self.sell_mode == 'usdc_only':
+            logger.info(f"SKIP Convert fallback for {asset}: sell mode is USDC-only")
+            return usdc_result
+        if self._quota_exhausted:
+            logger.debug(f"SKIP Convert fallback for {asset}: quota exhausted")
+            return usdc_result
+        logger.warning(f"CONVERT FALLBACK: USDC spot sell failed for {asset}, trying Convert EUR")
+        result = self._convert(asset, "EUR", quantity)
+        if result is not None and not result.get("error"):
+            result["alert"] = f"FALLBACK: {asset} sold via Convert EUR (USDC spot failed)"
+            return result
+        logger.error(f"SELL FAILED: {asset} - both USDC Spot and Convert failed")
+        return usdc_result or result
+
+    def _spot_buy_usdc(self, asset: str, usdc_amount: float):
+        symbol = asset + "USDC"
+        logger.info(f"USDC SPOT BUY: {usdc_amount:.2f} USDC -> {asset}")
+        try:
+            params = self._sign({
+                "symbol": symbol,
+                "side": "BUY",
+                "type": "MARKET",
+                "quoteOrderQty": f"{usdc_amount:.2f}",
+            })
+            resp = requests.post(
+                f"{self.rest_url}/api/v3/order",
+                params=params, headers=self._headers(), timeout=10
+            )
+            if resp.status_code != 200:
+                err = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"msg": resp.text}
+                logger.error(f"USDC SPOT BUY FAILED: {symbol} - {err}")
+                return {"error": f"USDC spot buy failed: {err.get('msg', err)}"}
+            order = resp.json()
+            filled_qty = float(order.get("executedQty", 0))
+            filled_quote = float(order.get("cummulativeQuoteQty", 0))
+            avg_price = filled_quote / filled_qty if filled_qty > 0 else 0
+            logger.info(f"USDC SPOT BUY FILLED: {filled_qty} {asset} @ {avg_price:.8g} for {filled_quote:.2f} USDC")
+            return {
+                "order_id": order.get("orderId"),
+                "filled_qty": filled_qty,
+                "filled_quote": filled_quote,
+                "avg_price": avg_price,
+                "status": "FILLED",
+                "method": "SPOT_USDC",
+                "to_asset": asset,
+            }
+        except Exception as e:
+            logger.error(f"USDC SPOT BUY ERROR: {asset} - {e}")
+            return {"error": str(e)}
+
+    def market_buy(self, asset: str, amount: float):
+        if amount <= 0:
+            logger.error(f"Invalid amount: {amount}")
+            return None
+        if self.buy_mode == 'usdc_only':
+            logger.info(f"BUY (USDC-only mode): {amount:.2f} USDC -> {asset}")
+            return self._spot_buy_usdc(asset, amount)
+        logger.info(f"BUY (Convert+USDC mode): {amount:.2f} EUR -> {asset}")
+        result = self._convert("EUR", asset, amount)
+        if result is not None and not result.get("error"):
+            return result
+        logger.warning(f"Convert buy failed for {asset}, trying USDC spot fallback")
+        return self._spot_buy_usdc(asset, amount)
+
+    def estimate_sell(self, symbol: str, quantity: float):
+        """Analyze order book to estimate fill price and slippage for a market sell."""
+        try:
+            resp = requests.get(f"{self.rest_url}/api/v3/depth",
+                                params={"symbol": symbol, "limit": 50}, timeout=10)
+            resp.raise_for_status()
+            book = resp.json()
+            bids = book.get("bids", [])
+
+            best_bid = float(bids[0][0]) if bids else 0
+            remaining = quantity
+            total_quote = 0.0
+            levels_used = 0
+
+            for price_str, qty_str in bids:
+                price = float(price_str)
+                qty = float(qty_str)
+                fill = min(remaining, qty)
+                total_quote += fill * price
+                remaining -= fill
+                levels_used += 1
+                if remaining <= 0:
+                    break
+
+            if remaining > 0:
+                return None
+
+            expected_avg = total_quote / quantity if quantity > 0 else 0
+            slippage_pct = ((best_bid - expected_avg) / best_bid * 100) if best_bid > 0 else 0
+
+            return {
+                "best_bid": best_bid,
+                "expected_avg_price": round(expected_avg, 10),
+                "expected_quote": round(total_quote, 4),
+                "slippage_pct": round(slippage_pct, 4),
+                "book_levels_used": levels_used,
+                "book_depth": len(bids)
+            }
+        except Exception as e:
+            logger.error(f"Order book fetch failed: {e}")
+            return None
+
+
+class StealthManager:
+    """Manual positions + public WebSocket price monitoring + hidden TP/SL."""
+
+    def __init__(self, executor: BinanceExecutor):
+        self.executor = executor
+        self.positions = {}   # id -> position dict
+        self.prices = {}      # symbol -> current price
+        self.book_prices = {} # symbol -> {avg_price, levels, best_bid, quote_total}
+        self.closed = []
+        self._lock = threading.Lock()
+        self._ws_thread = None
+        self._book_thread = None
+        self._ws = None
+        self._running = False
+        self.ws_connected = False
+        self._pos_file = os.path.join(DATA_DIR, "stealth_positions.json")
+        self._closed_file = os.path.join(DATA_DIR, "stealth_closed.json")
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self._pos_file, "r") as f:
+                self.positions = json.load(f)
+            logger.info(f"Loaded {len(self.positions)} manual positions")
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.positions = {}
+        try:
+            with open(self._closed_file, "r") as f:
+                self.closed = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.closed = []
+
+    def _save_positions(self):
+        with open(self._pos_file, "w") as f:
+            json.dump(self.positions, f, indent=2)
+        self._data_ts = 0
+
+    def _save_closed(self):
+        with open(self._closed_file, "w") as f:
+            json.dump(self.closed, f, indent=2)
+
+
+    def _get_binance_buy_price(self, asset, qty):
+        """Get actual buy price from Binance trade history (spot, convert, or fiat)."""
+        try:
+            api_key = self.executor.api_key
+            api_secret = self.executor.api_secret
+            rest_url = self.executor.rest_url
+            ts = str(int(time.time() * 1000))
+
+            # 1. Check fiat payments (Buy Crypto with EUR)
+            params = f"transactionType=0&timestamp={ts}"
+            sig = hmac.new(api_secret.encode(), params.encode(), hashlib.sha256).hexdigest()
+            r = requests.get(f"{rest_url}/sapi/v1/fiat/payments?{params}&signature={sig}",
+                             headers={"X-MBX-APIKEY": api_key}, timeout=10)
+            if r.status_code == 200:
+                for p in r.json().get("data", []):
+                    if p.get("cryptoCurrency") == asset and p.get("status") == "Completed":
+                        obt = float(p.get("obtainAmount", 0))
+                        if abs(obt - qty) / max(qty, 1) < 0.01:
+                            entry = float(p.get("price", 0))
+                            eur_amt = float(p.get("sourceAmount", 0))
+                            if entry > 0:
+                                logger.info(f"AUTO-SYNC: {asset} real price from fiat: {entry}, {eur_amt} EUR")
+                                return {"entry_price": entry, "invested_eur": eur_amt}
+
+            # 2. Check convert trades
+            ts = str(int(time.time() * 1000))
+            start = str(int(time.time() * 1000) - 30 * 24 * 3600 * 1000)
+            params = f"startTime={start}&endTime={ts}&limit=1000&timestamp={ts}"
+            sig = hmac.new(api_secret.encode(), params.encode(), hashlib.sha256).hexdigest()
+            r = requests.get(f"{rest_url}/sapi/v1/convert/tradeFlow?{params}&signature={sig}",
+                             headers={"X-MBX-APIKEY": api_key}, timeout=10)
+            if r.status_code == 200:
+                for t in r.json().get("list", []):
+                    if t.get("toAsset") == asset:
+                        obt = float(t.get("toAmount", 0))
+                        if abs(obt - qty) / max(qty, 1) < 0.01:
+                            from_amt = float(t.get("fromAmount", 0))
+                            from_asset = t.get("fromAsset", "")
+                            ratio = float(t.get("ratio", 0))
+                            if from_asset == "EUR" and ratio > 0:
+                                entry_usdt = from_amt * self.prices.get("EURUSDT", 1.17) / obt
+                                logger.info(f"AUTO-SYNC: {asset} real price from convert: {entry_usdt}, {from_amt} EUR")
+                                return {"entry_price": entry_usdt, "invested_eur": from_amt}
+                            elif from_asset == "USDT" and from_amt > 0:
+                                entry = from_amt / obt
+                                logger.info(f"AUTO-SYNC: {asset} real price from convert: {entry}")
+                                return {"entry_price": entry, "invested_usdt": from_amt}
+
+            # 3. Check spot trades
+            symbol = asset + "USDT"
+            ts = str(int(time.time() * 1000))
+            params = f"symbol={symbol}&timestamp={ts}"
+            sig = hmac.new(api_secret.encode(), params.encode(), hashlib.sha256).hexdigest()
+            r = requests.get(f"{rest_url}/api/v3/myTrades?{params}&signature={sig}",
+                             headers={"X-MBX-APIKEY": api_key}, timeout=10)
+            if r.status_code == 200:
+                buys = [t for t in r.json() if t.get("isBuyer")]
+                if buys:
+                    total_cost = sum(float(t["price"]) * float(t["qty"]) for t in buys)
+                    total_qty = sum(float(t["qty"]) for t in buys)
+                    if total_qty > 0:
+                        avg_price = total_cost / total_qty
+                        logger.info(f"AUTO-SYNC: {asset} real price from spot trades: {avg_price}")
+                        return {"entry_price": avg_price, "invested_usdt": total_cost}
+        except Exception as e:
+            logger.debug(f"AUTO-SYNC: could not get real price for {asset}: {e}")
+        return None
+
+    def add_position(self, coin: str, quantity: float, entry_price: float,
+                     tp_pct: float = 0, sl_pct: float = 0,
+                     tp_price: float = 0, sl_price: float = 0,
+                     tp_amount: float = 0, sl_amount: float = 0,
+                     stop_minutes: float = 0, buy_currency: str = "USDC"):
+        """Add a manual position."""
+        symbol = coin.upper().replace("USDT", "") + "USDT"
+        asset = coin.upper().replace("USDT", "")
+        pid = f"{symbol}_{int(time.time())}"
+        invested = entry_price * quantity
+
+        # Capture EURUSDT rate at entry for accurate EUR PnL
+        eur_rate = self.prices.get("EURUSDT", 0)
+        invested_eur = round(invested / eur_rate, 2) if eur_rate > 0 else 0
+
+        pos = {
+            "id": pid,
+            "symbol": symbol,
+            "asset": asset,
+            "quantity": quantity,
+            "entry_price": entry_price,
+            "invested_usdt": invested,
+            "invested_eur": invested_eur,
+            "entry_eur_rate": eur_rate,
+            "tp_pct": tp_pct,
+            "sl_pct": sl_pct,
+            "tp_price": tp_price if tp_price > 0 else (entry_price * (1 + tp_pct / 100) if tp_pct > 0 else 0),
+            "sl_price": sl_price if sl_price > 0 else (entry_price * (1 - sl_pct / 100) if sl_pct > 0 else 0),
+            "tp_amount": tp_amount,
+            "sl_amount": sl_amount,
+            "enabled": True,
+            "stop_minutes": stop_minutes,
+            "created": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "buy_currency": buy_currency
+        }
+
+        # Compute from amounts if provided
+        if tp_amount > 0 and invested > 0:
+            pos["tp_pct"] = (tp_amount / invested) * 100
+            pos["tp_price"] = entry_price * (1 + pos["tp_pct"] / 100)
+        if sl_amount > 0 and invested > 0:
+            pos["sl_pct"] = (sl_amount / invested) * 100
+            pos["sl_price"] = entry_price * (1 - pos["sl_pct"] / 100)
+
+        self.positions[pid] = pos
+        self._save_positions()
+        logger.info(f"Added position {pid}: {symbol} qty={quantity} entry={entry_price} TP={pos['tp_price']:.8g} SL={pos['sl_price']:.8g}")
+        self._restart_ws()
+        return pos
+
+    def update_position(self, pid: str, tp_pct=None, sl_pct=None,
+                        tp_price=None, sl_price=None,
+                        tp_amount=None, sl_amount=None, enabled=None,
+                        stop_minutes=None):
+        """Update TP/SL for an existing position."""
+        pos = self.positions.get(pid)
+        if not pos:
+            return None
+
+        entry = pos["entry_price"]
+        invested = pos.get("invested_usdt", entry * pos["quantity"])
+
+        if tp_pct is not None and tp_pct > 0:
+            pos["tp_pct"] = tp_pct
+            pos["tp_price"] = entry * (1 + tp_pct / 100)
+            pos["tp_amount"] = invested * tp_pct / 100
+        elif tp_amount is not None and tp_amount > 0 and invested > 0:
+            pos["tp_amount"] = tp_amount
+            pos["tp_pct"] = (tp_amount / invested) * 100
+            pos["tp_price"] = entry * (1 + pos["tp_pct"] / 100)
+        elif tp_price is not None and tp_price > 0:
+            pos["tp_price"] = tp_price
+            pos["tp_pct"] = ((tp_price - entry) / entry * 100) if entry > 0 else 0
+            pos["tp_amount"] = invested * pos["tp_pct"] / 100
+
+        if sl_pct is not None and sl_pct > 0:
+            pos["sl_pct"] = sl_pct
+            pos["sl_price"] = entry * (1 - sl_pct / 100)
+            pos["sl_amount"] = invested * sl_pct / 100
+        elif sl_amount is not None and sl_amount > 0 and invested > 0:
+            pos["sl_amount"] = sl_amount
+            pos["sl_pct"] = (sl_amount / invested) * 100
+            pos["sl_price"] = entry * (1 - pos["sl_pct"] / 100)
+        elif sl_price is not None and sl_price > 0:
+            pos["sl_price"] = sl_price
+            pos["sl_pct"] = ((entry - sl_price) / entry * 100) if entry > 0 else 0
+            pos["sl_amount"] = invested * pos["sl_pct"] / 100
+
+        if enabled is not None:
+            pos["enabled"] = enabled
+        if stop_minutes is not None:
+            pos["stop_minutes"] = stop_minutes
+
+        self.positions[pid] = pos
+        self._save_positions()
+        return pos
+
+    def remove_position(self, pid: str):
+        if pid in self.positions:
+            del self.positions[pid]
+            self._save_positions()
+            self._restart_ws()
+            return True
+        return False
+
+    def close_position(self, pid: str):
+        """Execute market sell and close the position."""
+        pos = self.positions.get(pid)
+        if not pos:
+            return None
+
+        symbol = pos["symbol"]
+        qty = pos["quantity"]
+        usdt_price = self.prices.get(symbol, 0)
+
+        # Check actual Binance balance and sell ALL if more than tracked
+        asset = pos.get("asset", symbol.replace("USDT", "").replace("USDC", ""))
+        actual_balance = self.executor.get_balance(asset)
+        if actual_balance is not None and actual_balance > 0:
+            if abs(actual_balance - qty) / max(qty, 0.0001) > 0.001:
+                logger.info(f"SELL ADJUST: {asset} tracked={qty:.8g} Binance={actual_balance:.8g} - using actual")
+            qty = actual_balance
+
+        estimate = self.executor.estimate_sell(symbol, qty)
+
+        _buy_cur = pos.get("buy_currency", "USDC")
+        _method = "SPOT_USDC" if _buy_cur == "USDC" else None
+        result = self.executor.market_sell(symbol, qty, trade_method=_method)
+
+        if result is None:
+            logger.error(f"CLOSE FAILED - position kept: {symbol} - sell returned None (exception or no balance)")
+            return {"error": "Sell failed - no response from Binance"}
+
+        if result.get("error"):
+            logger.error(f"CLOSE FAILED - position kept: {symbol} - {result['error']}")
+            return {"error": result["error"]}
+
+        # PnL uses USDT price (entry is USDT-denominated)
+        exit_price_usdt = usdt_price
+        entry = pos["entry_price"]
+        value_usdt = qty * exit_price_usdt if exit_price_usdt > 0 else pos.get("invested_usdt", 0)
+        pnl_pct = ((exit_price_usdt - entry) / entry * 100) if entry > 0 and exit_price_usdt > 0 else 0
+
+        # EUR received from Convert
+        eur_received = result.get("filled_quote", 0)
+
+        # EUR PnL: exit EUR - invested EUR (using entry-time EUR rate)
+        invested_eur = pos.get("invested_eur", 0)
+        if invested_eur <= 0 and pos.get("entry_eur_rate", 0) > 0:
+            invested_eur = pos.get("invested_usdt", 0) / pos["entry_eur_rate"]
+        pnl_eur = round(eur_received - invested_eur, 2) if invested_eur > 0 else 0
+
+        slippage = {}
+        if estimate and usdt_price > 0:
+            slippage = {
+                "best_bid": estimate["best_bid"],
+                "expected_avg": estimate["expected_avg_price"],
+                "actual_usdt": usdt_price,
+                "slippage_vs_best": round((estimate["best_bid"] - usdt_price) / estimate["best_bid"] * 100, 4) if estimate["best_bid"] > 0 else 0,
+                "book_levels_used": estimate["book_levels_used"],
+            }
+
+        closed = {
+            "id": pid,
+            "symbol": symbol,
+            "asset": pos["asset"],
+            "quantity": qty,
+            "entry_price": entry,
+            "exit_price": exit_price_usdt,
+            "invested_usdt": pos.get("invested_usdt", 0),
+            "invested_eur": round(invested_eur, 2),
+            "exit_value_usdt": round(value_usdt, 2),
+            "exit_value_eur": round(eur_received, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "pnl_usdt": round(value_usdt - pos.get("invested_usdt", 0), 2),
+            "pnl_eur": pnl_eur,
+            "exit_reason": "MANUAL",
+            "exit_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "order": result,
+            "slippage": slippage
+        }
+        self.closed.append(closed)
+        self._save_closed()
+
+        with self._lock:
+            if pid in self.positions:
+                del self.positions[pid]
+                self._save_positions()
+
+        logger.info(f"MANUAL CLOSE: {symbol} @ {exit_price_usdt:.8g} USDT, received {eur_received:.2f} EUR (invested {invested_eur:.2f} EUR), PnL EUR={pnl_eur:+.2f}")
+        return closed
+
+    def close_all_positions(self):
+        """Close all open positions via market sell."""
+        results = []
+        pids = list(self.positions.keys())
+        for pid in pids:
+            result = self.close_position(pid)
+            if result:
+                results.append(result)
+        return results
+
+    _sell_cooldown = {}
+
+    def _check_tp_sl(self, symbol: str, price: float):
+        """Check all positions for this symbol."""
+        to_close = []
+        with self._lock:
+            for pid, pos in list(self.positions.items()):
+                if pos["symbol"] != symbol or not pos.get("enabled"):
+                    continue
+
+                tp = pos.get("tp_price", 0)
+                sl = pos.get("sl_price", 0)
+                reason = None
+
+                if tp > 0 and price >= tp:
+                    reason = "TP"
+                elif sl > 0 and price <= sl:
+                    reason = "SL"
+
+                stop_min = pos.get("stop_minutes", 0)
+                if not reason and stop_min > 0:
+                    created = datetime.strptime(pos.get("created", ""), "%Y-%m-%d %H:%M:%S")
+                    elapsed = (datetime.utcnow() - created).total_seconds() / 60.0
+                    if elapsed >= stop_min:
+                        reason = "TIME"
+
+                if reason:
+                    to_close.append((pid, pos, reason, price))
+
+        import time as _time
+        for pid, pos, reason, price in to_close:
+            last_fail = self._sell_cooldown.get(pid, 0)
+            if _time.time() - last_fail < 300:
+                continue
+            logger.info(f"{reason} HIT: {pos['symbol']} @ {price:.8g} (TP={pos.get('tp_price',0):.8g}, SL={pos.get('sl_price',0):.8g})")
+            _buy_cur = pos.get("buy_currency", "USDC")
+            _method = "SPOT_USDC" if _buy_cur == "USDC" else None
+            result = self.executor.market_sell(pos["symbol"], pos["quantity"], trade_method=_method)
+
+            if result is None or (isinstance(result, dict) and result.get("error")):
+                err_msg = result.get("error", "Unknown") if result else "No response"
+                logger.error(f"{reason} CLOSE FAILED - position kept: {pos['symbol']} - {err_msg}")
+                self._sell_cooldown[pid] = _time.time()
+                continue
+
+            entry = pos["entry_price"]
+            pnl_pct = ((price - entry) / entry * 100) if entry > 0 else 0
+            value = pos["quantity"] * price
+
+            eur_received = result.get("filled_quote", 0)
+            invested_eur = pos.get("invested_eur", 0)
+            if invested_eur <= 0 and pos.get("entry_eur_rate", 0) > 0:
+                invested_eur = pos.get("invested_usdt", 0) / pos["entry_eur_rate"]
+            pnl_eur = round(eur_received - invested_eur, 2) if invested_eur > 0 else 0
+
+            closed = {
+                "id": pid,
+                "symbol": pos["symbol"],
+                "asset": pos["asset"],
+                "quantity": pos["quantity"],
+                "entry_price": entry,
+                "exit_price": price,
+                "invested_usdt": pos.get("invested_usdt", 0),
+                "invested_eur": round(invested_eur, 2),
+                "exit_value_usdt": round(value, 2),
+                "exit_value_eur": round(eur_received, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "pnl_usdt": round(value - pos.get("invested_usdt", 0), 2),
+                "pnl_eur": pnl_eur,
+                "exit_reason": reason,
+                "exit_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "order": result
+            }
+            self.closed.append(closed)
+            self._save_closed()
+
+            with self._lock:
+                if pid in self.positions:
+                    del self.positions[pid]
+                    self._save_positions()
+
+            logger.info(f"CLOSED {pos['symbol']}: {reason} @ {price:.8g}, PnL={pnl_pct:+.2f}%")
+
+    def _process_ticker(self, item):
+        symbol = item.get("s", "")
+        price = float(item.get("c", 0))
+        if symbol and price > 0:
+            self.prices[symbol] = price
+            self._check_tp_sl(symbol, price)
+
+    def _on_ws_message(self, ws, message):
+        try:
+            data = json.loads(message)
+            if "data" in data:
+                inner = data["data"]
+                if isinstance(inner, list):
+                    for item in inner:
+                        self._process_ticker(item)
+                else:
+                    self._process_ticker(inner)
+            elif isinstance(data, list):
+                for item in data:
+                    self._process_ticker(item)
+            elif "s" in data:
+                self._process_ticker(data)
+        except Exception as e:
+            logger.error(f"WS error: {e}")
+
+    def _on_ws_open(self, ws):
+        self.ws_connected = True
+        logger.info("Public WebSocket connected (no API key used)")
+
+    def _on_ws_error(self, ws, error):
+        logger.error(f"WS error: {error}")
+        self.ws_connected = False
+
+    def _on_ws_close(self, ws, code, msg):
+        self.ws_connected = False
+        if self._running:
+            time.sleep(5)
+            self._connect_ws()
+
+    def _connect_ws(self):
+        symbols = set()
+        for pos in self.positions.values():
+            symbols.add(pos["symbol"].lower())
+        if not symbols:
+            logger.info("No positions to monitor")
+            return
+
+        symbols.add("eurusdt")
+        streams = [f"{s}@miniTicker" for s in symbols]
+        url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
+        logger.info(f"Connecting public WebSocket for {len(symbols)} symbols (NO API key)...")
+
+        self._ws = websocket.WebSocketApp(
+            url,
+            on_message=lambda ws, msg: self._on_ws_message(ws, msg),
+            on_error=lambda ws, err: self._on_ws_error(ws, err),
+            on_close=lambda ws, code, msg: self._on_ws_close(ws, code, msg),
+            on_open=lambda ws: self._on_ws_open(ws)
+        )
+        self._ws.run_forever()
+
+    def _restart_ws(self):
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+        self.start_monitoring()
+
+    def _book_loop(self):
+        """Periodically fetch order book for each position to calculate real fill prices."""
+        _book_backoff = 0
+        while self._running:
+            if time.time() < _book_backoff:
+                time.sleep(10)
+                continue
+            symbols_qty = {}
+            for pos in list(self.positions.values()):
+                sym = pos["symbol"]
+                qty = pos["quantity"]
+                if sym in symbols_qty:
+                    symbols_qty[sym] += qty
+                else:
+                    symbols_qty[sym] = qty
+
+            for symbol, qty in symbols_qty.items():
+                est = self.executor.estimate_sell(symbol, qty)
+                if est:
+                    self.book_prices[symbol] = {
+                        "avg_price": est["expected_avg_price"],
+                        "best_bid": est["best_bid"],
+                        "levels": est["book_levels_used"],
+                        "quote_total": est["expected_quote"],
+                        "slippage_pct": est["slippage_pct"]
+                    }
+                elif est is None:
+                    _book_backoff = time.time() + 120
+                    logger.warning("Order book rate limited, backing off 2 minutes")
+                    break
+                time.sleep(0.5)
+            time.sleep(10)
+
+    def _sync_binance_loop(self):
+        """Auto-sync positions with actual Binance holdings every 30 seconds (reads shared cache)."""
+        MIN_USDT_VALUE = 1.0
+        while self._running:
+            try:
+                try:
+                    with open("/opt/crypto-shared/cache.json", "r") as _cf:
+                        _cache = json.load(_cf)
+                    balances = {k: v for k, v in _cache.get("balances", {}).items() if v > 0}
+                    _tp = _cache.get("ticker_prices", {})
+                    for sym, pr in _tp.items():
+                        if sym.endswith("USDT") and pr > 0:
+                            self.prices[sym] = pr
+                    _eur = _cache.get("eur_rate", 0)
+                    if _eur > 0:
+                        self.prices["EURUSDT"] = _eur
+                except Exception as _ce:
+                    logger.error(f"AUTO-SYNC: shared cache read failed: {_ce}, falling back to API")
+                    params = self.executor._sign({})
+                    resp = requests.get(
+                        f"{self.executor.rest_url}/api/v3/account",
+                        params=params, headers=self.executor._headers(), timeout=10
+                    )
+                    if resp.status_code != 200:
+                        time.sleep(30)
+                        continue
+                    balances = {}
+                    for b in resp.json().get("balances", []):
+                        free = float(b["free"])
+                        if free > 0:
+                            balances[b["asset"]] = free
+                self._binance_balances = balances
+
+                tracked_assets = {}
+                for pid, pos in list(self.positions.items()):
+                    tracked_assets[pos.get("asset", "")] = pid
+
+                changed = False
+
+                # Remove positions where coin is gone from Binance
+                for pid, pos in list(self.positions.items()):
+                    asset = pos.get("asset", "")
+                    bal = balances.get(asset, 0)
+                    qty = pos.get("quantity", 0)
+                    if bal < qty * 0.05:
+                        logger.info(f"AUTO-SYNC: removing {asset} (balance {bal}, tracked {qty})")
+                        del self.positions[pid]
+                        changed = True
+
+                # Log quantity differences (display uses live Binance balance)
+                for pid, pos in list(self.positions.items()):
+                    asset = pos.get("asset", "")
+                    bal = balances.get(asset, 0)
+                    qty = pos.get("quantity", 0)
+                    if qty > 0 and bal > qty * 0.01 and (bal > qty * 1.05 or bal < qty * 0.95):
+                        logger.debug(f"AUTO-SYNC: {asset} tracked={qty} binance={bal} (display uses live)")
+
+                # Add new coins from Binance not in stealth
+                skip_assets = {"BNB", "USDT", "USDC", "EUR", "BTC", "ETH", "BUSD", "FDUSD", "LDUSDT", "BETH"}
+                for asset, bal in balances.items():
+                    if asset in tracked_assets or asset in skip_assets:
+                        continue
+                    symbol = asset + "USDT"
+                    price = self.prices.get(symbol, 0)
+                    if price <= 0:
+                        pass
+                    if price <= 0:
+                        continue
+                    value = bal * price
+                    if value < MIN_USDT_VALUE:
+                        continue
+                    pid = f"{symbol}_{int(time.time())}_{hash(asset) % 1000}"
+                    eur_rate = 0
+                    try:
+                        cached = self.prices.get("EURUSDT", 0)
+                        if cached > 0:
+                            eur_rate = cached
+                    except Exception:
+                        pass
+                    real = self._get_binance_buy_price(asset, bal)
+                    if real:
+                        entry_price = real.get("entry_price", price)
+                        invested_eur = real.get("invested_eur", 0)
+                        invested_usdt = real.get("invested_usdt", 0)
+                        if invested_eur > 0 and invested_usdt <= 0 and eur_rate > 0:
+                            invested_usdt = invested_eur * eur_rate
+                        elif invested_usdt > 0 and invested_eur <= 0 and eur_rate > 0:
+                            invested_eur = invested_usdt / eur_rate
+                        if invested_usdt <= 0:
+                            invested_usdt = bal * entry_price
+                        if invested_eur <= 0 and eur_rate > 0:
+                            invested_eur = invested_usdt / eur_rate
+                    else:
+                        entry_price = price
+                        invested_usdt = bal * price
+                        invested_eur = round(invested_usdt / eur_rate, 2) if eur_rate > 0 else 0
+                    self.positions[pid] = {
+                        "id": pid,
+                        "symbol": symbol,
+                        "asset": asset,
+                        "quantity": bal,
+                        "entry_price": entry_price,
+                        "invested_usdt": round(invested_usdt, 4),
+                        "invested_eur": round(invested_eur, 2),
+                        "entry_eur_rate": eur_rate,
+                        "tp_pct": 10,
+                        "sl_pct": 0,
+                        "tp_price": round(entry_price * 1.10, 8),
+                        "sl_price": 0,
+                        "tp_amount": 0,
+                        "sl_amount": 0,
+                        "enabled": True,
+                        "stop_minutes": 0,
+                        "created": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                        "buy_currency": "USDC"
+                    }
+                    logger.info(f"AUTO-SYNC: added {asset} qty={bal} price={price}")
+                    changed = True
+
+                if changed:
+                    self._save_positions()
+
+            except Exception as e:
+                logger.error(f"AUTO-SYNC error: {e}")
+            time.sleep(30)
+
+    def start_monitoring(self):
+        if self._ws_thread and self._ws_thread.is_alive():
+            return
+        self._running = True
+        self._ws_thread = threading.Thread(target=self._connect_ws, daemon=True)
+        self._ws_thread.start()
+        if not self._book_thread or not self._book_thread.is_alive():
+            self._book_thread = threading.Thread(target=self._book_loop, daemon=True)
+            self._book_thread.start()
+        if not hasattr(self, "_sync_thread") or not self._sync_thread or not self._sync_thread.is_alive():
+            self._sync_thread = threading.Thread(target=self._sync_binance_loop, daemon=True)
+            self._sync_thread.start()
+            logger.info("AUTO-SYNC: Binance balance sync started (every 5s)")
+
+    def get_data(self):
+        import time as _t
+        _now = _t.time()
+        if hasattr(self, '_data_cache') and hasattr(self, '_data_ts') and _now - self._data_ts < 2:
+            return self._data_cache
+        positions_list = []
+        total_invested = 0
+        total_value = 0
+
+        eur_rate = self.prices.get("EURUSDT", 0)
+        for pid, pos in list(self.positions.items()):
+            current = self.prices.get(pos["symbol"], 0)
+            entry = pos["entry_price"]
+            asset = pos.get("asset", pos["symbol"].replace("USDT", "").replace("USDC", ""))
+            live_bal = getattr(self, '_binance_balances', {}).get(asset, 0)
+            qty = live_bal if live_bal > 0 else pos["quantity"]
+            invested = qty * entry if entry > 0 else pos.get("invested_usdt", 0)
+            value = qty * current if current > 0 else invested
+            pnl_pct = ((current - entry) / entry * 100) if entry > 0 and current > 0 else 0
+            pnl_usdt = value - invested
+
+            book = self.book_prices.get(pos["symbol"], {})
+            book_avg = book.get("avg_price", 0)
+            book_value = qty * book_avg if book_avg > 0 else 0
+            book_pnl_usdt = book_value - invested if book_avg > 0 else 0
+            book_pnl_pct = ((book_avg - entry) / entry * 100) if entry > 0 and book_avg > 0 else 0
+            book_after_fee = book_value * 0.999 if book_avg > 0 else 0
+            book_real_pnl = book_after_fee - invested if book_avg > 0 else 0
+
+            total_invested += invested
+            total_value += value
+
+            positions_list.append({
+                "id": pid,
+                "symbol": pos["symbol"],
+                "asset": pos["asset"],
+                "quantity": qty,
+                "entry_price": entry,
+                "current_price": current,
+                "invested_usdt": round(invested, 2),
+                "invested_eur": pos.get("invested_eur", round(invested / eur_rate, 2) if eur_rate > 0 else 0),
+                "entry_eur_rate": pos.get("entry_eur_rate", 0),
+                "value_usdt": round(value, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "pnl_usdt": round(pnl_usdt, 2),
+                "tp_pct": pos.get("tp_pct", 0),
+                "sl_pct": pos.get("sl_pct", 0),
+                "tp_price": pos.get("tp_price", 0),
+                "sl_price": pos.get("sl_price", 0),
+                "tp_amount": pos.get("tp_amount", 0),
+                "sl_amount": pos.get("sl_amount", 0),
+                "enabled": pos.get("enabled", False),
+                "stop_minutes": pos.get("stop_minutes", 0),
+                "created": pos.get("created", ""),
+                "strategy": _get_strategy_map().get(pos["symbol"], []),
+                "book_avg": round(book_avg, 10),
+                "book_best_bid": book.get("best_bid", 0),
+                "book_levels": book.get("levels", 0),
+                "book_slippage": book.get("slippage_pct", 0),
+                "book_value": round(book_value, 2),
+                "book_real_pnl": round(book_real_pnl, 2),
+                "book_real_pnl_pct": round(((book_after_fee - invested) / invested * 100) if invested > 0 and book_avg > 0 else 0, 2)
+            })
+
+        positions_list.sort(key=lambda x: abs(x["value_usdt"]), reverse=True)
+
+        total_book_pnl = sum(p["book_real_pnl"] for p in positions_list if p["book_avg"] > 0)
+        eur_rate = self.prices.get("EURUSDT", 0)
+
+        _result = {
+            "positions": positions_list,
+            "closed": self.closed[-50:],
+            "total_positions": len(positions_list),
+            "total_invested": round(total_invested, 2),
+            "total_value": round(total_value, 2),
+            "total_pnl": round(total_value - total_invested, 2),
+            "total_book_pnl": round(total_book_pnl, 2),
+            "ws_connected": self.ws_connected,
+            "eur_rate": round(eur_rate, 5)
+        }
+        self._data_cache = _result
+        self._data_ts = _now
+        return _result
+
+
+# ─── Dashboard HTML ───────────────────────────────────────────────
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stealth TP/SL Manager</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0e17; color: #e0e0e0; }
+        .header {
+            background: linear-gradient(135deg, #1a1f2e 0%, #0d1117 100%);
+            padding: 12px 24px;
+            border-bottom: 1px solid #2d333b;
+            display: flex; align-items: center; justify-content: space-between;
+            position: sticky; top: 0; z-index: 100;
+        }
+        .header h1 { font-size: 18px; color: #f0883e; }
+        .header-sub { font-size: 11px; color: #484f58; }
+        .header-stats { display: flex; gap: 20px; font-size: 13px; color: #8b949e; }
+        .header-stats .value { color: #e0e0e0; font-weight: 600; }
+        .status-badge {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600;
+        }
+        .status-badge.on { border: 1px solid #238636; color: #3fb950; }
+        .status-badge.off { border: 1px solid #da3633; color: #f85149; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; }
+        .dot.on { background: #3fb950; animation: pulse 2s infinite; }
+        .dot.off { background: #f85149; }
+        @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+        .add-form {
+            background: #161b22; border: 1px solid #2d333b; border-radius: 8px;
+            padding: 16px; margin-bottom: 20px;
+        }
+        .add-form h3 { color: #f0883e; margin-bottom: 12px; font-size: 14px; }
+        .form-row { display: flex; gap: 8px; align-items: flex-end; }
+        .form-group { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
+        .form-group.btn-group { flex: 0 0 auto; }
+        .form-group label { font-size: 11px; color: #8b949e; }
+        .form-group input {
+            background: #0d1117; border: 1px solid #2d333b; color: #e0e0e0;
+            padding: 6px 8px; border-radius: 4px; font-size: 13px; width: 100%;
+        }
+        .btn {
+            padding: 6px 16px; border: none; border-radius: 4px;
+            font-size: 13px; font-weight: 600; cursor: pointer;
+        }
+        .btn-add { background: #f0883e; color: #000; }
+        .btn-add:hover { background: #f09860; }
+        .btn-primary { background: #238636; color: #fff; }
+        .btn-primary:hover { background: #2ea043; }
+        .btn-danger { background: #da3633; color: #fff; }
+        .btn-danger:hover { background: #f85149; }
+        .btn-secondary { background: #2d333b; color: #e0e0e0; }
+        .btn-small { padding: 2px 6px; font-size: 11px; }
+
+        .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
+        .card { background: #161b22; border: 1px solid #2d333b; border-radius: 8px; padding: 14px; }
+        .card-label { font-size: 11px; color: #8b949e; margin-bottom: 4px; }
+        .card-value { font-size: 22px; font-weight: 700; }
+
+        .section-title { font-size: 15px; color: #f0883e; margin-bottom: 10px; }
+        .badge { background: #2d333b; padding: 2px 8px; border-radius: 10px; font-size: 12px; color: #8b949e; margin-left: 6px; }
+
+        table { width: 100%; border-collapse: collapse; font-size: 12px; table-layout: auto; } .table-wrap { overflow-x: auto; }
+        th { background: #161b22; padding: 5px 4px; text-align: left; color: #8b949e; font-weight: 600; border-bottom: 1px solid #2d333b; white-space: nowrap; }
+        td { padding: 5px 4px; border-bottom: 1px solid #1a1f2e; white-space: nowrap; }
+        tr:hover { background: #161b22; }
+        .pnl-positive { color: #3fb950; font-weight: 600; }
+        .pnl-negative { color: #f85149; font-weight: 600; }
+        .active { color: #3fb950; }
+        .inactive { color: #484f58; }
+        .empty { text-align: center; padding: 30px; color: #484f58; }
+
+        .alert-box { padding: 12px 20px; border-radius: 6px; font-size: 14px; display: none; position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 9999; min-width: 400px; max-width: 80%; text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
+        .alert-success { background: #0d2818; border: 1px solid #238636; color: #3fb950; }
+        .alert-error { background: #2d0a0a; border: 1px solid #da3633; color: #f85149; }
+
+        input.tbl { background: #0d1117; border: 1px solid #2d333b; color: #e0e0e0; padding: 2px 4px; border-radius: 3px; font-size: 11px; width: 55px; }
+
+        .quota-alert { padding: 10px 20px; text-align: center; font-weight: 700; font-size: 14px; display: none; }
+        .quota-alert.yellow { background: #7a6100; color: #ffd33d; display: block; }
+        .quota-alert.red { background: #6e1b1b; color: #f85149; display: block; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h1>Stealth TP/SL Manager</h1>
+            <div class="header-sub">Manual positions - No API monitoring - Binance can't see your levels</div>
+        </div>
+        <div class="header-stats">
+            <span>Positions: <span class="value" id="hPos">0</span></span>
+            <span>Invested: <span class="value" id="hInv">--</span></span>
+            <span>Value: <span class="value" id="hVal">--</span></span>
+            <span>PnL: <span class="value" id="hPnl">--</span></span>
+            <span style="color:#f0883e;">EUR: <span class="value" id="hEur">--</span></span>
+        </div>
+        <div id="statusBadge" class="status-badge off">
+            <div id="statusDot" class="dot off"></div>
+            <span id="statusText">--</span>
+        </div>
+    </div>
+
+    <div id="quotaAlert" class="quota-alert"></div>
+    <div id="tradeModeTable" style="margin-bottom:4px;background:#1a1a2e;border:1px solid #333;border-radius:6px;padding:10px 16px;">
+        <table style="width:100%;border-collapse:collapse;text-align:center;">
+            <tr style="border-bottom:1px solid #333;">
+                <th style="color:#888;font-size:11px;padding:4px 8px;text-align:left;">Direction</th>
+                <th style="color:#888;font-size:11px;padding:4px 8px;">Convert + USDC</th>
+                <th style="color:#888;font-size:11px;padding:4px 8px;">Only USDC</th>
+            </tr>
+            <tr style="border-bottom:1px solid #222;">
+                <td style="color:#ccc;font-weight:600;font-size:13px;padding:6px 8px;text-align:left;">Buy / Sell</td>
+                <td style="padding:6px 8px;"><button id="btnBothConvert" onclick="setTradeMode('both','convert_usdc')" style="padding:4px 14px;border:none;border-radius:4px;font-weight:700;cursor:pointer;font-size:11px;background:#333;color:#888;">SET</button></td>
+                <td style="padding:6px 8px;"><button id="btnBothUsdc" onclick="setTradeMode('both','usdc_only')" style="padding:4px 14px;border:none;border-radius:4px;font-weight:700;cursor:pointer;font-size:11px;background:#333;color:#888;">SET</button></td>
+            </tr>
+            <tr style="border-bottom:1px solid #222;">
+                <td style="color:#ccc;font-weight:600;font-size:13px;padding:6px 8px;text-align:left;">Buy</td>
+                <td style="padding:6px 8px;"><button id="btnBuyConvert" onclick="setTradeMode('buy','convert_usdc')" style="padding:4px 14px;border:none;border-radius:4px;font-weight:700;cursor:pointer;font-size:11px;background:#2d5a2d;color:#4ade80;">ACTIVE</button></td>
+                <td style="padding:6px 8px;"><button id="btnBuyUsdc" onclick="setTradeMode('buy','usdc_only')" style="padding:4px 14px;border:none;border-radius:4px;font-weight:700;cursor:pointer;font-size:11px;background:#333;color:#888;">-</button></td>
+            </tr>
+            <tr>
+                <td style="color:#ccc;font-weight:600;font-size:13px;padding:6px 8px;text-align:left;">Sell</td>
+                <td style="padding:6px 8px;"><button id="btnSellConvert" onclick="setTradeMode('sell','convert_usdc')" style="padding:4px 14px;border:none;border-radius:4px;font-weight:700;cursor:pointer;font-size:11px;background:#2d5a2d;color:#4ade80;">ACTIVE</button></td>
+                <td style="padding:6px 8px;"><button id="btnSellUsdc" onclick="setTradeMode('sell','usdc_only')" style="padding:4px 14px;border:none;border-radius:4px;font-weight:700;cursor:pointer;font-size:11px;background:#333;color:#888;">-</button></td>
+            </tr>
+        </table>
+    </div>
+    <div id="sellAlertBanner" style="display:none;background:#4a2800;border:1px solid #f0883e;color:#f0883e;padding:10px 20px;text-align:center;font-weight:700;font-size:14px;margin-bottom:4px;border-radius:6px;cursor:pointer" onclick="this.style.display='none'"></div>
+    <div class="container">
+        <div id="alertBox" class="alert-box"></div>
+
+        <div class="add-form">
+            <h3>Add New Position</h3>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Coin (e.g. DGB)</label>
+                    <input type="text" id="addCoin" placeholder="DGB" style="text-transform:uppercase;" />
+                </div>
+                <div class="form-group">
+                    <label>Quantity</label>
+                    <input type="text" inputmode="decimal" id="addQty" placeholder="1000" />
+                </div>
+                <div class="form-group">
+                    <label style="color:#f0883e;">Total EUR</label>
+                    <input type="text" inputmode="decimal" id="addTotalEur" placeholder="250" style="border-color:#f0883e;" />
+                </div>
+                <div class="form-group">
+                    <label>Total USDT</label>
+                    <input type="text" inputmode="decimal" id="addTotalUsdt" placeholder="280" />
+                </div>
+                <div class="form-group">
+                    <label>Entry Price (USDT)</label>
+                    <input type="text" inputmode="decimal" id="addEntry" placeholder="auto" />
+                </div>
+                <div class="form-group">
+                    <label>TP %</label>
+                    <input type="text" inputmode="decimal" id="addTpPct" placeholder="50" />
+                </div>
+                <div class="form-group">
+                    <label>SL %</label>
+                    <input type="text" inputmode="decimal" id="addSlPct" placeholder="20" />
+                </div>
+                <div class="form-group">
+                    <label>TP Amount USDT</label>
+                    <input type="text" inputmode="decimal" id="addTpAmt" placeholder="100" />
+                </div>
+                <div class="form-group">
+                    <label>SL Amount USDT</label>
+                    <input type="text" inputmode="decimal" id="addSlAmt" placeholder="100" />
+                </div>
+                <div class="form-group">
+                    <label style="color:#f0883e;">Min. Stop</label>
+                    <input type="text" inputmode="decimal" id="addStopMin" placeholder="60" style="border-color:#f0883e;" />
+                </div>
+                <div class="form-group btn-group">
+                    <label>&nbsp;</label>
+                    <button class="btn btn-add" id="btnAddPosition" style="white-space:nowrap;">Add Position</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="cards">
+            <div class="card"><div class="card-label">Open Positions</div><div class="card-value" id="cPos">0</div></div>
+            <div class="card"><div class="card-label">Total Invested</div><div class="card-value" id="cInv">--</div></div>
+            <div class="card"><div class="card-label">Current Value</div><div class="card-value" id="cVal">--</div></div>
+            <div class="card"><div class="card-label">Total PnL</div><div class="card-value" id="cPnl">--</div></div>
+            <div class="card"><div class="card-label">Total PnL BOOK</div><div class="card-value" id="cBookPnl">--</div></div>
+            <div class="card" style="display:flex;align-items:center;justify-content:center;">
+                <button class="btn btn-danger" id="btnCloseAll" style="font-size:15px;padding:12px 24px;">CLOSE ALL</button>
+            </div>
+        </div>
+
+        <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:8px; padding:10px 16px; background:#161b22; border:1px solid #30363d; border-radius:6px;">
+            <span style="color:#c9d1d9;font-size:13px;font-weight:700;margin-right:4px;">CLOSE ALL WHEN</span>
+            <div style="display:flex;align-items:center;gap:4px;">
+                <label style="color:#8b949e;font-size:12px;white-space:nowrap;">TP USDT</label>
+                <input id="condAllTp" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                <span id="condAllTpEur" style="color:#8b949e;font-size:11px;"></span>
+            </div>
+            <div style="display:flex;align-items:center;gap:4px;">
+                <label style="color:#8b949e;font-size:12px;white-space:nowrap;">TP Book USDT</label>
+                <input id="condAllTpBook" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                <span id="condAllTpBookEur" style="color:#8b949e;font-size:11px;"></span>
+            </div>
+            <div style="display:flex;align-items:center;gap:4px;">
+                <label style="color:#8b949e;font-size:12px;white-space:nowrap;">SL USDT</label>
+                <input id="condAllSl" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                <span id="condAllSlEur" style="color:#8b949e;font-size:11px;"></span>
+            </div>
+            <div style="display:flex;align-items:center;gap:4px;">
+                <label style="color:#8b949e;font-size:12px;white-space:nowrap;">SL Book USDT</label>
+                <input id="condAllSlBook" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                <span id="condAllSlBookEur" style="color:#8b949e;font-size:11px;"></span>
+            </div>
+            <button id="btnCondAllActivate" onclick="toggleConditionalAll()" style="background:#238636;color:#fff;border:none;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;border-radius:4px;">ACTIVATE</button>
+            <span id="condAllStatus" style="font-size:12px;color:#8b949e;"></span>
+        </div>
+
+        <div class="section-title">Active Positions <span class="badge" id="posBadge">0</span></div>
+        <div id="posTable"><div class="empty">No positions. Add one above.</div></div>
+        <div id="selectionBar" style="display:none; margin-top:8px; padding:12px 16px; background:#161b22; border:1px solid #30363d; border-radius:6px; flex-wrap:wrap; align-items:center; gap:10px;">
+            <button onclick="closeSelectedPos()" style="background:#e74c3c;color:#fff;border:none;padding:10px 20px;font-size:14px;font-weight:700;cursor:pointer;border-radius:6px;">CLOSE SELECTED</button>
+            <span id="selSummary" style="font-size:14px;"></span>
+            <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; width:100%; margin-top:6px;">
+                <span style="color:#c9d1d9;font-size:13px;font-weight:700;margin-right:4px;">CLOSE SELECTED WHEN</span>
+                <div style="display:flex;align-items:center;gap:4px;">
+                    <label style="color:#8b949e;font-size:12px;white-space:nowrap;">TP USDT</label>
+                    <input id="condSelTp" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                    <span id="condSelTpEur" style="color:#8b949e;font-size:11px;"></span>
+                </div>
+                <div style="display:flex;align-items:center;gap:4px;">
+                    <label style="color:#8b949e;font-size:12px;white-space:nowrap;">TP Book USDT</label>
+                    <input id="condSelTpBook" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                    <span id="condSelTpBookEur" style="color:#8b949e;font-size:11px;"></span>
+                </div>
+                <div style="display:flex;align-items:center;gap:4px;">
+                    <label style="color:#8b949e;font-size:12px;white-space:nowrap;">SL USDT</label>
+                    <input id="condSelSl" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                    <span id="condSelSlEur" style="color:#8b949e;font-size:11px;"></span>
+                </div>
+                <div style="display:flex;align-items:center;gap:4px;">
+                    <label style="color:#8b949e;font-size:12px;white-space:nowrap;">SL Book USDT</label>
+                    <input id="condSelSlBook" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                    <span id="condSelSlBookEur" style="color:#8b949e;font-size:11px;"></span>
+                </div>
+                <button id="btnCondSelActivate" onclick="toggleConditionalSel()" style="background:#238636;color:#fff;border:none;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;border-radius:4px;">ACTIVATE</button>
+                <span id="condSelStatus" style="font-size:12px;color:#8b949e;"></span>
+            </div>
+        </div>
+
+        <div style="margin-top:30px;">
+            <div class="section-title">Executed Trades <span class="badge" id="closedBadge">0</span></div>
+            <div id="closedTable"><div class="empty">No executed trades yet</div></div>
+        </div>
+    </div>
+
+    <script>
+        var prevClosed = -1;
+        var eurRate = 0;
+
+        function pn(id) {
+            var el = document.getElementById(id);
+            if (!el) return 0;
+            var v = el.value.replace(/,/g, '.');
+            return parseFloat(v) || 0;
+        }
+
+        function toEur(usdt) {
+            if (!eurRate || eurRate <= 0) return '';
+            return ' (' + (usdt / eurRate).toFixed(2) + ' EUR)';
+        }
+
+        function playAlert(type) {
+            try {
+                var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                if (type === 'tp') {
+                    [800,1000,1200].forEach(function(f,i) {
+                        var o=ctx.createOscillator(), g=ctx.createGain();
+                        o.connect(g); g.connect(ctx.destination);
+                        o.frequency.value=f; o.type='sine'; g.gain.value=0.3;
+                        o.start(ctx.currentTime+i*0.15); o.stop(ctx.currentTime+i*0.15+0.12);
+                    });
+                } else {
+                    var o=ctx.createOscillator(), g=ctx.createGain();
+                    o.connect(g); g.connect(ctx.destination);
+                    o.frequency.value=400; o.type='sawtooth'; g.gain.value=0.25;
+                    o.start(ctx.currentTime); o.stop(ctx.currentTime+0.6);
+                }
+            } catch(e) {}
+        }
+
+        function fp(n) { if(!n||n===0) return '--'; if(n>=100)return n.toFixed(2); if(n>=1)return n.toFixed(4); if(n>=0.01)return n.toFixed(6); return n.toFixed(8); }
+        function fm(n,d) { if(n===null||n===undefined) return '--'; return Number(n).toFixed(d||2); }
+        function formatDuration(created) {
+            if(!created) return '-';
+            var cr = new Date(created+'Z');
+            var seconds = (new Date() - cr) / 1000;
+            if(seconds <= 0) return '-';
+            var d = Math.floor(seconds / 86400);
+            var h = Math.floor((seconds % 86400) / 3600);
+            var m = Math.floor((seconds % 3600) / 60);
+            if(d > 0) return d + 'd ' + h + 'h';
+            if(h > 0) return h + 'h ' + m + 'm';
+            return m + 'm';
+        }
+
+        function showAlert(msg,type) {
+            var b=document.getElementById('alertBox');
+            b.textContent=msg; b.className='alert-box alert-'+type; b.style.display='block';
+            setTimeout(function(){b.style.display='none';},15000);
+        }
+
+        function addPosition() {
+            var coin = document.getElementById('addCoin').value.trim().toUpperCase();
+            var qty = pn('addQty');
+            var entry = pn('addEntry');
+            if (!coin || !qty || !entry) { showAlert('Fill coin, quantity, and entry price','error'); return; }
+            var body = {coin:coin, quantity:qty, entry_price:entry};
+            var v;
+            v = pn('addTpPct'); if(v>0) body.tp_pct=v;
+            v = pn('addSlPct'); if(v>0) body.sl_pct=v;
+            v = pn('addTpAmt'); if(v>0) body.tp_amount=v;
+            v = pn('addSlAmt'); if(v>0) body.sl_amount=v;
+            v = pn('addStopMin'); if(v>0) body.stop_minutes=v;
+            var te = pn('addTotalEur');
+            body.buy_currency = (te > 0) ? 'EUR' : 'USDC';
+            fetch('/api/position', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+            .then(r=>r.json()).then(d=>{
+                if(d.error) showAlert(d.error,'error');
+                else { showAlert('Position added: '+coin,'success'); refresh(); }
+            });
+        }
+
+        function calcAmt(pctId, amtId, invested) {
+            var pct = parseFloat(document.getElementById(pctId).value) || 0;
+            if(pct > 0 && invested > 0) {
+                document.getElementById(amtId).value = (invested * pct / 100).toFixed(2);
+            }
+        }
+        function calcPct(amtId, pctId, invested) {
+            var amt = parseFloat(document.getElementById(amtId).value) || 0;
+            if(amt > 0 && invested > 0) {
+                document.getElementById(pctId).value = (amt / invested * 100).toFixed(2);
+            }
+        }
+        // Live sync TP/SL pct <-> amount
+        document.addEventListener('input', function(e) {
+            var el = e.target;
+            if(!el.id) return;
+            var parts, pid, invested, pos;
+            // Find position invested from _posCache
+            if(el.id.startsWith('tp_') && !el.id.startsWith('tpa_')) {
+                pid = el.id.substring(3);
+                pos = (_posCache||{})[pid];
+                if(pos) calcAmt('tp_'+pid, 'tpa_'+pid, pos.invested_usdt||0);
+            } else if(el.id.startsWith('sl_') && !el.id.startsWith('sla_')) {
+                pid = el.id.substring(3);
+                pos = (_posCache||{})[pid];
+                if(pos) calcAmt('sl_'+pid, 'sla_'+pid, pos.invested_usdt||0);
+            } else if(el.id.startsWith('tpa_')) {
+                pid = el.id.substring(4);
+                pos = (_posCache||{})[pid];
+                if(pos) calcPct('tpa_'+pid, 'tp_'+pid, pos.invested_usdt||0);
+            } else if(el.id.startsWith('sla_')) {
+                pid = el.id.substring(4);
+                pos = (_posCache||{})[pid];
+                if(pos) calcPct('sla_'+pid, 'sl_'+pid, pos.invested_usdt||0);
+            }
+        });
+        var _posCache = {};
+
+        function updatePos(pid) {
+            var body = {};
+            var v;
+            v = pn('tp_'+pid); if(v>0) body.tp_pct=v;
+            v = pn('sl_'+pid); if(v>0) body.sl_pct=v;
+            v = pn('tpa_'+pid); if(v>0) body.tp_amount=v;
+            v = pn('sla_'+pid); if(v>0) body.sl_amount=v;
+            v = pn('sm_'+pid); if(v>0) body.stop_minutes=v;
+            fetch('/api/position/'+pid, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+            .then(r=>r.json()).then(d=>{
+                if(d.error) showAlert(d.error,'error');
+                else { showAlert('TP/SL updated','success'); refresh(); }
+            });
+        }
+
+        function closePos(pid) {
+            if(!confirm('CLOSE POSITION - This will SELL on Binance at market price. Continue?')) return;
+            showAlert('Selling on Binance...','success');
+            fetch('/api/position/'+pid+'/close', {method:'POST'})
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+                try {
+                    if(d.error) {
+                        if(d.error.indexOf('insufficient balance')>=0 || d.error.indexOf('no balance')>=0) {
+                                fetch('/api/position/'+pid, {method:'DELETE'}).then(function(r){return r.json();}).then(function(){
+                                    showAlert('Not on Binance - removed from tracker','success'); setTimeout(function(){ location.reload(); }, 1500);
+                                });
+                        } else if(d.error.indexOf('not found')>=0) {
+                            showAlert('Position already removed','success');
+                            setTimeout(function(){ location.reload(); }, 1500);
+                        } else {
+                            showAlert('Sell failed: '+d.error,'error');
+                        }
+                        return;
+                    }
+                    var c = d.closed || {};
+                    var pnl = (c.pnl_usdt||0)>=0 ? '+' : '';
+                    pnl += fm(c.pnl_usdt||0);
+                    var msg = (c.asset||'?')+' SOLD for '+(c.exit_value_eur||0).toFixed(2)+' USDC | PnL: '+pnl+' USDT ('+fm(c.pnl_pct||0)+'%)';
+                    showAlert(msg, (c.pnl_usdt||0)>=0?'success':'error');
+                    setTimeout(function(){ location.reload(); }, 10000);
+                } catch(e) {
+                    showAlert('Position sold successfully!','success');
+                    refresh();
+                }
+            })
+            .catch(function(e){
+                showAlert('Network error: '+e.message,'error');
+            });
+        }
+
+        function removePos(pid) {
+            if(!confirm('Remove from tracker only (does NOT sell on Binance). Continue?')) return;
+            fetch('/api/position/'+pid, {method:'DELETE'})
+            .then(r=>r.json()).then(d=>{ showAlert('Position removed','success'); refresh(); });
+        }
+
+        function disablePos(pid) {
+            fetch('/api/position/'+pid, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:false})})
+            .then(r=>r.json()).then(d=>{ showAlert('TP/SL disabled','success'); refresh(); });
+        }
+
+        function enablePos(pid) {
+            fetch('/api/position/'+pid, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:true})})
+            .then(r=>r.json()).then(d=>{ showAlert('TP/SL enabled','success'); refresh(); });
+        }
+
+        function setTradeMode(direction, mode) {
+            fetch('/api/trade-mode', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({direction:direction, mode:mode})})
+            .then(function(r){return r.json();}).then(function(d){
+                if(d.ok) refresh();
+            });
+        }
+        var _refreshing = false;
+        function refresh() {
+            if(_refreshing) return;
+            _refreshing = true;
+            fetch('/api/data').then(r=>r.json()).then(function(d) {
+                _refreshing = false;
+                if(d.eur_rate > 0) eurRate = d.eur_rate;
+
+                // Quota alert
+                var qa = document.getElementById('quotaAlert');
+                if(d.quota) {
+                    var pct = d.quota.pct || 0;
+                    if(d.quota.exhausted || pct >= 100) {
+                        qa.className = 'quota-alert red';
+                        qa.textContent = 'CONVERT QUOTA EXHAUSTED - Buy/sell manually or wait for midnight UTC reset. Calls today: ' + d.quota.calls_today;
+                        qa.style.display = 'block';
+                    } else if(pct >= 90) {
+                        qa.className = 'quota-alert red';
+                        qa.textContent = 'CONVERT QUOTA CRITICAL: ' + Math.round(pct) + '% used (' + d.quota.calls_today + '/' + d.quota.limit + ' calls). Almost exhausted!';
+                        qa.style.display = 'block';
+                    } else if(pct >= 50) {
+                        qa.className = 'quota-alert yellow';
+                        qa.textContent = 'CONVERT QUOTA WARNING: ' + Math.round(pct) + '% used (' + d.quota.calls_today + '/' + d.quota.limit + ' calls)';
+                        qa.style.display = 'block';
+                    } else {
+                        qa.style.display = 'none';
+                    }
+                } else { qa.style.display = 'none'; }
+                // Update trade mode table
+                if(d.quota) {
+                    var bm = d.quota.buy_mode || 'convert_usdc';
+                    var sm = d.quota.sell_mode || 'convert_usdc';
+                    var on = {background:'#2d5a2d', color:'#4ade80', text:'ACTIVE'};
+                    var off = {background:'#333', color:'#888', text:'-'};
+                    function setBtn(id, s) { var b=document.getElementById(id); if(b){b.style.background=s.background;b.style.color=s.color;b.textContent=s.text;} }
+                    setBtn('btnBuyConvert', bm==='convert_usdc' ? on : off);
+                    setBtn('btnBuyUsdc', bm==='usdc_only' ? on : off);
+                    setBtn('btnSellConvert', sm==='convert_usdc' ? on : off);
+                    setBtn('btnSellUsdc', sm==='usdc_only' ? on : off);
+                    setBtn('btnBothConvert', (bm==='convert_usdc' && sm==='convert_usdc') ? on : off);
+                    setBtn('btnBothUsdc', (bm==='usdc_only' && sm==='usdc_only') ? on : off);
+                }
+
+                // Sell fallback alerts
+                var sab = document.getElementById('sellAlertBanner');
+                if(d.sell_alerts && d.sell_alerts.length > 0) {
+                    var recent = d.sell_alerts.filter(function(a) {
+                        var t = new Date(a.time + 'Z');
+                        return (Date.now() - t.getTime()) < 3600000;
+                    });
+                    if(recent.length > 0) {
+                        var last = recent[recent.length - 1];
+                        var isFail = last.message.indexOf('TOTAL FAILURE') >= 0;
+                        sab.style.background = isFail ? '#6e1b1b' : '#4a2800';
+                        sab.style.borderColor = isFail ? '#da3633' : '#f0883e';
+                        sab.style.color = isFail ? '#f85149' : '#f0883e';
+                        sab.innerHTML = (isFail ? 'TOTAL FAILURE: ' : 'ALERT FALLBACK: ') + last.message + ' (' + last.asset + ' at ' + last.time + ' UTC)' + (recent.length > 1 ? ' [+' + (recent.length-1) + ' more]' : '') + ' <span style="opacity:0.6;font-size:12px">(click to dismiss)</span>';
+                        sab.style.display = 'block';
+                    } else { sab.style.display = 'none'; }
+                } else { sab.style.display = 'none'; }
+
+                var badge = document.getElementById('statusBadge');
+                var dot = document.getElementById('statusDot');
+                var txt = document.getElementById('statusText');
+                if(d.ws_connected) { badge.className='status-badge on'; dot.className='dot on'; txt.textContent='Monitoring'; }
+                else { badge.className='status-badge off'; dot.className='dot off'; txt.textContent='No positions'; }
+
+                document.getElementById('hPos').textContent = d.total_positions;
+                document.getElementById('hInv').textContent = fm(d.total_invested)+' USDT';
+                document.getElementById('hVal').textContent = fm(d.total_value)+' USDT';
+                var pnlEl = document.getElementById('hPnl');
+                pnlEl.textContent = (d.total_pnl>=0?'+':'')+fm(d.total_pnl)+' USDT';
+                pnlEl.className = 'value '+(d.total_pnl>=0?'pnl-positive':'pnl-negative');
+                document.getElementById('hEur').textContent = eurRate>0 ? 'PnL '+(d.total_pnl>=0?'+':'')+fm(d.total_pnl/eurRate)+' EUR | Val '+fm(d.total_value/eurRate)+' EUR' : '--';
+
+                document.getElementById('cPos').textContent = d.total_positions;
+                document.getElementById('cInv').textContent = fm(d.total_invested)+' USDT'+toEur(d.total_invested);
+                document.getElementById('cVal').textContent = fm(d.total_value)+' USDT'+toEur(d.total_value);
+                var cp = document.getElementById('cPnl');
+                cp.textContent = (d.total_pnl>=0?'+':'')+fm(d.total_pnl)+' USDT'+toEur(d.total_pnl);
+                cp.className = 'card-value '+(d.total_pnl>=0?'pnl-positive':'pnl-negative');
+                var cbp = document.getElementById('cBookPnl');
+                cbp.textContent = (d.total_book_pnl>=0?'+':'')+fm(d.total_book_pnl)+' USDT'+toEur(d.total_book_pnl);
+                cbp.className = 'card-value '+(d.total_book_pnl>=0?'pnl-positive':'pnl-negative');
+                document.getElementById('posBadge').textContent = d.total_positions;
+
+                // EUR conversion for conditional inputs
+                if(eurRate > 0) {
+                    function showEur(inputId, spanId) {
+                        var v = parseFloat(document.getElementById(inputId).value) || 0;
+                        document.getElementById(spanId).textContent = v > 0 ? '(' + (v / eurRate).toFixed(2) + ' EUR)' : '';
+                    }
+                    showEur('condAllTp','condAllTpEur'); showEur('condAllTpBook','condAllTpBookEur');
+                    showEur('condAllSl','condAllSlEur'); showEur('condAllSlBook','condAllSlBookEur');
+                    showEur('condSelTp','condSelTpEur'); showEur('condSelTpBook','condSelTpBookEur');
+                    showEur('condSelSl','condSelSlEur'); showEur('condSelSlBook','condSelSlBookEur');
+                }
+                // Check conditional triggers
+                if(d.conditional_triggered) {
+                    d.conditional_triggered.forEach(function(t) {
+                        if(t.mode==='sel') {
+                            condSelActive=false;
+                            document.getElementById('btnCondSelActivate').textContent='ACTIVATE';
+                            document.getElementById('btnCondSelActivate').style.background='#238636';
+                            document.getElementById('condSelStatus').innerHTML='<span style="color:#3fb950;">TRIGGERED: Closed '+t.closed+' pos ('+t.reason+': '+t.value.toFixed(2)+' USDT)</span>';
+                        } else {
+                            condAllActive=false;
+                            document.getElementById('btnCondAllActivate').textContent='ACTIVATE';
+                            document.getElementById('btnCondAllActivate').style.background='#238636';
+                            document.getElementById('condAllStatus').innerHTML='<span style="color:#3fb950;">TRIGGERED: Closed '+t.closed+' pos ('+t.reason+': '+t.value.toFixed(2)+' USDT)</span>';
+                        }
+                    });
+                    refresh();
+                }
+
+                
+                var _sortKey = 'value'; var _sortDir = -1;
+                function setSort(key) {
+                    if (_sortKey === key) _sortDir = _sortDir * -1;
+                    else { _sortKey = key; _sortDir = key === 'strategy' ? 1 : -1; }
+                    refresh();
+                }
+                function sortPositions(arr) {
+                    return arr.slice().sort(function(a, b) {
+                        var va, vb;
+                        if (_sortKey === 'opened') { va = a.created || ''; vb = b.created || ''; }
+                        else if (_sortKey === 'duration') { va = a.created || 'z'; vb = b.created || 'z'; return _sortDir * (va < vb ? 1 : va > vb ? -1 : 0); }
+                        else if (_sortKey === 'strategy') { va = (a.strategy||[]).join(','); vb = (b.strategy||[]).join(','); }
+                        else { va = Math.abs(a.value_usdt||0); vb = Math.abs(b.value_usdt||0); }
+                        if (va < vb) return -1 * _sortDir;
+                        if (va > vb) return 1 * _sortDir;
+                        return 0;
+                    });
+                }
+
+                var div = document.getElementById('posTable');
+                var focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('#posTable');
+                var checkedIds = {};
+                document.querySelectorAll('.selTrade:checked').forEach(function(cb){ checkedIds[cb.dataset.id]=true; });
+                var allChecked = document.getElementById('selectAll') && document.getElementById('selectAll').checked;
+                if(focused) { /* skip table rebuild while user is editing inputs */ }
+                else if(d.positions.length>0) {
+                    var h = '<table><tr><th><input type="checkbox" id="selectAll" onchange="toggleAll(this)"></th><th>Coin</th><th style="cursor:pointer" onclick="setSort(\\x27opened\\x27)">Opened ' + (_sortKey==='opened' ? (_sortDir>0?'\u25B2':'\u25BC') : '') + '</th><th style="cursor:pointer" onclick="setSort(\\x27duration\\x27)">Duration ' + (_sortKey==='duration' ? (_sortDir>0?'\u25B2':'\u25BC') : '') + '</th><th style="cursor:pointer" onclick="setSort(\\x27strategy\\x27)">Strategy ' + (_sortKey==='strategy' ? (_sortDir>0?'\u25B2':'\u25BC') : '') + '</th><th>Qty</th><th>Entry</th><th>Current</th><th>Invested</th><th>Value</th><th>PnL</th><th>TP %</th><th>SL %</th><th>TP Amt</th><th>SL Amt</th><th>Min Stop</th><th>TP / SL Price</th><th>Status</th><th></th></tr>';
+                    var sorted = sortPositions(d.positions); _posCache={}; sorted.forEach(function(p) { _posCache[p.id]=p;
+                        var pc = p.pnl_pct>=0?'pnl-positive':'pnl-negative';
+                        var sc = p.enabled?'active':'inactive';
+                        var st = p.enabled?'ACTIVE':'OFF';
+                        var eurInv = eurRate>0 ? '<br><small style="color:#f0883e;">'+fm(p.invested_usdt/eurRate)+' EUR</small>' : '';
+                        var eurVal = eurRate>0 ? '<br><small style="color:#f0883e;">'+fm(p.value_usdt/eurRate)+' EUR</small>' : '';
+                        var eurPnlAmt = eurRate>0 ? (p.value_usdt/eurRate) - p.invested_eur : 0;
+                        var eurPnlVal = eurRate>0 ? (eurPnlAmt>=0?'+':'')+fm(eurPnlAmt) : '';
+                        var eurPnl = '';
+                        var ec = eurPnlAmt>=0 ? 'pnl-positive' : 'pnl-negative';
+                        if(eurRate>0 && p.book_avg>0) { eurPnl = '<br><small class="'+ec+'">'+eurPnlVal+' EUR</small>'; }
+                        else if(eurRate>0) { eurPnl = '<br><span class="'+ec+'" style="font-size:22px;font-weight:700;">'+eurPnlVal+' EUR</span>'; }
+                        var brc = p.book_real_pnl>=0?'pnl-positive':'pnl-negative';
+                        var bookInfo = '';
+                        if(p.book_avg>0) {
+                            var brEurVal = eurRate>0 ? (p.book_real_pnl>=0?'+':'')+fm(p.book_real_pnl/eurRate) : '';
+                            bookInfo = '<br><small class="'+brc+'" style="font-weight:600;">BOOK: '+(p.book_real_pnl_pct>=0?'+':'')+fm(p.book_real_pnl_pct)+'% ('+(p.book_real_pnl>=0?'+':'')+fm(p.book_real_pnl)+' USDT)</small>';
+                            if(eurRate>0) bookInfo += '<br><span class="'+brc+'" style="font-size:22px;font-weight:700;">'+brEurVal+' EUR</span>';
+                            bookInfo += '<br><small style="color:#8b949e;">Fill: '+fp(p.book_avg)+' | Slip: '+fm(p.book_slippage,3)+'% | '+p.book_levels+' lvl</small>';
+                        }
+                        h += '<tr>';
+                        h += '<td><input type="checkbox" class="selTrade" data-id="'+p.id+'" data-pnl="'+fm(p.pnl_usdt)+'" data-book="'+fm(p.book_real_pnl||p.pnl_usdt)+'" onchange="updateSelection()"></td>';
+                        h += '<td><a href="https://www.binance.com/en/trade/'+p.asset+'_USDT" target="_blank" style="color:#58a6ff;text-decoration:none;"><strong>'+p.asset+'</strong></a></td>';
+                        var openDate = p.created ? p.created.substring(0,10) : '--';
+                        h += '<td style="text-align:center;font-size:11px;color:#c9d1d9;">'+openDate+'</td>';
+                        h += '<td style="text-align:center;font-size:12px;color:#8b949e;">'+formatDuration(p.created)+'</td>';
+                        var strat = (p.strategy && p.strategy.length>0) ? p.strategy.join(', ') : '--';
+                        h += '<td style="text-align:center;font-size:11px;color:#58a6ff;font-weight:600;">'+strat+'</td>';
+                        h += '<td>'+fm(p.quantity,4)+'</td>';
+                        h += '<td>'+fp(p.entry_price)+'</td>';
+                        h += '<td>'+fp(p.current_price)+'</td>';
+                        h += '<td style="min-width:110px;white-space:nowrap;">'+fm(p.invested_usdt)+eurInv+'</td>';
+                        h += '<td style="min-width:110px;white-space:nowrap;">'+fm(p.value_usdt)+eurVal+'</td>';
+                        h += '<td class="'+pc+'" style="white-space:normal;min-width:160px;">'+(p.pnl_pct>=0?'+':'')+fm(p.pnl_pct)+'% ('+(p.pnl_usdt>=0?'+':'')+fm(p.pnl_usdt)+' USDT)'+eurPnl+bookInfo+'</td>';
+                        h += '<td><input class="tbl" type="text" inputmode="decimal" id="tp_'+p.id+'" value="'+(p.tp_pct?Number(p.tp_pct.toFixed(2)):'')+'"/></td>';
+                        h += '<td><input class="tbl" type="text" inputmode="decimal" id="sl_'+p.id+'" value="'+(p.sl_pct?Number(p.sl_pct.toFixed(2)):'')+'"/></td>';
+                        h += '<td><input class="tbl" type="text" inputmode="decimal" id="tpa_'+p.id+'" value="'+(p.tp_amount?Number(p.tp_amount.toFixed(2)):'')+'"/></td>';
+                        h += '<td><input class="tbl" type="text" inputmode="decimal" id="sla_'+p.id+'" value="'+(p.sl_amount?Number(p.sl_amount.toFixed(2)):'')+'"/></td>';
+                        var stopVal = p.stop_minutes||'';
+                        var stopInfo = '';
+                        if(p.stop_minutes>0 && p.created) {
+                            var cr = new Date(p.created+'Z');
+                            var now = new Date();
+                            var elapsed = (now - cr) / 60000;
+                            var remain = Math.max(0, p.stop_minutes - elapsed);
+                            if(remain<=0) stopInfo = '<br><small style="color:#f85149;">EXPIRED</small>';
+                            else if(remain<60) stopInfo = '<br><small style="color:#f0883e;">'+Math.ceil(remain)+'m left</small>';
+                            else stopInfo = '<br><small style="color:#f0883e;">'+Math.floor(remain/60)+'h '+Math.ceil(remain%60)+'m</small>';
+                        }
+                        h += '<td><input class="tbl" type="text" inputmode="decimal" id="sm_'+p.id+'" value="'+stopVal+'" placeholder="min"/>'+stopInfo+'</td>';
+                        h += '<td>'+fp(p.tp_price)+' / '+fp(p.sl_price)+'</td>';
+                        h += '<td class="'+sc+'">'+st+'</td>';
+                        h += '<td>';
+                        h += '<button class="btn btn-danger btn-small" onclick="closePos(\\''+p.id+'\\')">Close</button> ';
+                        h += '<button class="btn btn-primary btn-small" onclick="updatePos(\\''+p.id+'\\')">Save</button> ';
+                        if(p.enabled) h += '<button class="btn btn-secondary btn-small" onclick="disablePos(\\''+p.id+'\\')">Pause</button> ';
+                        else h += '<button class="btn btn-primary btn-small" onclick="enablePos(\\''+p.id+'\\')">Enable</button> ';
+                        h += '<button class="btn btn-secondary btn-small" onclick="removePos(\\''+p.id+'\\')">X</button>';
+                        h += '</td></tr>';
+                    });
+                    h += '</table>';
+                    div.innerHTML = h;
+                    if(allChecked) {
+                        var sa=document.getElementById('selectAll'); if(sa) sa.checked=true;
+                        document.querySelectorAll('.selTrade').forEach(function(cb){ cb.checked=true; });
+                    } else {
+                        document.querySelectorAll('.selTrade').forEach(function(cb){ if(checkedIds[cb.dataset.id]) cb.checked=true; });
+                    }
+                    updateSelection();
+                } else {
+                    div.innerHTML = '<div class="empty">No positions. Add one above.</div>';
+                    var bar=document.getElementById('selectionBar'); if(bar) bar.style.display='none';
+                }
+
+                document.getElementById('closedBadge').textContent = d.closed.length;
+                var cd = document.getElementById('closedTable');
+                if(d.closed.length>0) {
+                    if(prevClosed>=0 && d.closed.length>prevClosed) {
+                        var last = d.closed[d.closed.length-1];
+                        playAlert(last.exit_reason==='TP'?'tp':'sl');
+                    }
+                    var ch = '<table><tr><th>Time</th><th>Coin</th><th style="cursor:pointer" onclick="setSort(\\x27opened\\x27)">Opened ' + (_sortKey==='opened' ? (_sortDir>0?'\u25B2':'\u25BC') : '') + '</th><th style="cursor:pointer" onclick="setSort(\\x27duration\\x27)">Duration ' + (_sortKey==='duration' ? (_sortDir>0?'\u25B2':'\u25BC') : '') + '</th><th style="cursor:pointer" onclick="setSort(\\x27strategy\\x27)">Strategy ' + (_sortKey==='strategy' ? (_sortDir>0?'\u25B2':'\u25BC') : '') + '</th><th>Entry</th><th>Exit</th><th>Inv USDT</th><th>Inv EUR</th><th>Ret EUR</th><th>PnL USDT</th><th>PnL EUR</th><th>Reason</th></tr>';
+                    d.closed.slice().reverse().forEach(function(t) {
+                        var tc = t.pnl_pct>=0?'pnl-positive':'pnl-negative';
+                        var eurPnl = t.pnl_eur!==undefined ? (t.pnl_eur>=0?'+':'')+fm(t.pnl_eur)+' EUR' : (eurRate>0 ? (t.pnl_usdt>=0?'+':'')+fm(t.pnl_usdt/eurRate)+' EUR' : '--');
+                        ch += '<tr><td>'+t.exit_time+'</td><td><a href="https://www.binance.com/en/trade/'+t.asset+'_USDT" target="_blank" style="color:#58a6ff;text-decoration:none;"><strong>'+t.asset+'</strong></a></td><td style="text-align:center;font-size:12px;color:#8b949e;">'+(t.duration||'-')+'</td>';
+                        ch += '<td>'+fp(t.entry_price)+'</td><td>'+fp(t.exit_price)+'</td>';
+                        ch += '<td>'+fm(t.invested_usdt)+'</td>';
+                        ch += '<td>'+(t.invested_eur?fm(t.invested_eur):'--')+'</td>';
+                        ch += '<td class="'+tc+'">'+(t.exit_value_eur?fm(t.exit_value_eur):'--')+'</td>';
+                        ch += '<td class="'+tc+'">'+(t.pnl_pct>=0?'+':'')+fm(t.pnl_pct)+'% ('+(t.pnl_usdt>=0?'+':'')+fm(t.pnl_usdt)+')</td>';
+                        ch += '<td class="'+tc+'">'+eurPnl+'</td>';
+                        ch += '<td>'+(function(r){var c=r==='MANUAL'?'#f0883e':'#3fb950';var l=r==='MANUAL'?'M':'A';return '<span style="display:inline-block;background:'+c+';color:#fff;font-weight:700;font-size:12px;width:26px;height:26px;line-height:26px;text-align:center;border-radius:4px;" title="'+r+'">'+l+'</span>';})(t.exit_reason)+'</td></tr>';
+                    });
+                    ch += '</table>';
+                    cd.innerHTML = ch;
+                } else {
+                    cd.innerHTML = '<div class="empty">No executed trades yet</div>';
+                }
+                prevClosed = d.closed.length;
+            }).catch(function(){ _refreshing = false; });
+        }
+
+        document.getElementById('btnAddPosition').addEventListener('click', function() { addPosition(); });
+
+        document.getElementById('btnCloseAll').addEventListener('click', function() {
+            if(!confirm('CLOSE ALL POSITIONS - This will SELL ALL on Binance at market price. Are you sure?')) return;
+            fetch('/api/close-all', {method:'POST'})
+            .then(r=>r.json()).then(d=>{
+                if(d.error) showAlert(d.error,'error');
+                else { showAlert('ALL positions closed - '+d.closed+' sold on Binance','success'); playAlert('sl'); refresh(); }
+            });
+        });
+
+        function getInvested() {
+            return pn('addQty') * pn('addEntry');
+        }
+
+        function calcEntryAndAmounts() {
+            var inv = getInvested();
+            var tp = pn('addTpPct'), sl = pn('addSlPct');
+            if (inv > 0 && tp > 0) document.getElementById('addTpAmt').value = (inv * tp / 100).toFixed(2);
+            if (inv > 0 && sl > 0) document.getElementById('addSlAmt').value = (inv * sl / 100).toFixed(2);
+        }
+
+        document.getElementById('addTotalEur').addEventListener('input', function() {
+            var totalEur = pn('addTotalEur');
+            var qty = pn('addQty');
+            if (totalEur > 0 && eurRate > 0) {
+                var totalUsdt = totalEur * eurRate;
+                document.getElementById('addTotalUsdt').value = totalUsdt.toFixed(2);
+                if (qty > 0) {
+                    document.getElementById('addEntry').value = (totalUsdt / qty).toFixed(8);
+                    calcEntryAndAmounts();
+                }
+            }
+        });
+
+        document.getElementById('addTotalUsdt').addEventListener('input', function() {
+            var totalUsdt = pn('addTotalUsdt');
+            var qty = pn('addQty');
+            if (totalUsdt > 0 && eurRate > 0) {
+                document.getElementById('addTotalEur').value = (totalUsdt / eurRate).toFixed(2);
+            }
+            if (totalUsdt > 0 && qty > 0) {
+                document.getElementById('addEntry').value = (totalUsdt / qty).toFixed(8);
+                calcEntryAndAmounts();
+            }
+        });
+
+        document.getElementById('addTpPct').addEventListener('input', function() {
+            var inv = getInvested();
+            if (inv > 0) document.getElementById('addTpAmt').value = (inv * pn('addTpPct') / 100).toFixed(2);
+        });
+        document.getElementById('addSlPct').addEventListener('input', function() {
+            var inv = getInvested();
+            if (inv > 0) document.getElementById('addSlAmt').value = (inv * pn('addSlPct') / 100).toFixed(2);
+        });
+        document.getElementById('addTpAmt').addEventListener('input', function() {
+            var inv = getInvested();
+            if (inv > 0) document.getElementById('addTpPct').value = (pn('addTpAmt') / inv * 100).toFixed(1);
+        });
+        document.getElementById('addSlAmt').addEventListener('input', function() {
+            var inv = getInvested();
+            if (inv > 0) document.getElementById('addSlPct').value = (pn('addSlAmt') / inv * 100).toFixed(1);
+        });
+        document.getElementById('addQty').addEventListener('input', function() {
+            var qty = pn('addQty');
+            var totalEur = pn('addTotalEur');
+            var totalUsdt = pn('addTotalUsdt');
+            if (totalEur > 0 && eurRate > 0 && qty > 0) {
+                totalUsdt = totalEur * eurRate;
+                document.getElementById('addTotalUsdt').value = totalUsdt.toFixed(2);
+                document.getElementById('addEntry').value = (totalUsdt / qty).toFixed(8);
+            } else if (totalUsdt > 0 && qty > 0) {
+                document.getElementById('addEntry').value = (totalUsdt / qty).toFixed(8);
+            }
+            calcEntryAndAmounts();
+        });
+        document.getElementById('addEntry').addEventListener('input', function() {
+            calcEntryAndAmounts();
+        });
+
+        function toggleAll(el) {
+            document.querySelectorAll('.selTrade').forEach(function(cb){ cb.checked=el.checked; });
+            updateSelection();
+        }
+        function updateSelection() {
+            var checks=document.querySelectorAll('.selTrade:checked');
+            var bar=document.getElementById('selectionBar');
+            if(checks.length===0){ bar.style.display='none'; return; }
+            bar.style.display='flex';
+            var totalPnl=0, totalBook=0;
+            checks.forEach(function(cb){ totalPnl+=parseFloat(cb.dataset.pnl); totalBook+=parseFloat(cb.dataset.book); });
+            var pc=totalPnl>=0?'#3fb950':'#f85149';
+            var bc=totalBook>=0?'#3fb950':'#f85149';
+            var ps=totalPnl>=0?'+':'';
+            var bs=totalBook>=0?'+':'';
+            var pnlEurStr=eurRate>0?' <span style="color:'+pc+';">('+ps+fm(totalPnl/eurRate)+' EUR)</span>':'';
+            var bookEurStr=eurRate>0?' <span style="color:'+bc+';">('+bs+fm(totalBook/eurRate)+' EUR)</span>':'';
+            document.getElementById('selSummary').innerHTML=
+                '<strong>'+checks.length+' selected</strong> | '+
+                'PnL: <span style="color:'+pc+';font-weight:700;">'+ps+fm(totalPnl)+' USDT</span>'+pnlEurStr+' | '+
+                'BOOK: <span style="color:'+bc+';font-weight:700;">'+bs+fm(totalBook)+' USDT</span>'+bookEurStr;
+        }
+        function closeSelectedPos() {
+            var checks=document.querySelectorAll('.selTrade:checked');
+            if(checks.length===0) return;
+            var ids=[];
+            checks.forEach(function(cb){ ids.push(cb.dataset.id); });
+            if(!confirm('Close '+ids.length+' selected positions? This will SELL on Binance.')) return;
+            fetch('/api/close-selected',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:ids})})
+            .then(function(r){return r.json();}).then(function(d){
+                if(d.error) showAlert(d.error,'error');
+                else { showAlert('Closed '+d.closed+' positions','success'); refresh(); }
+            });
+        }
+
+        var condSelActive=false, condAllActive=false;
+        function toggleConditionalSel() {
+            if(condSelActive){
+                fetch('/api/conditional-close/sel',{method:'DELETE'}); condSelActive=false;
+                document.getElementById('btnCondSelActivate').textContent='ACTIVATE';
+                document.getElementById('btnCondSelActivate').style.background='#238636';
+                document.getElementById('condSelStatus').textContent=''; return;
+            }
+            var checks=document.querySelectorAll('.selTrade:checked');
+            if(checks.length===0){alert('Select positions first');return;}
+            var ids=[]; checks.forEach(function(cb){ids.push(cb.dataset.id);});
+            var tp=parseFloat(document.getElementById('condSelTp').value)||0;
+            var tpB=parseFloat(document.getElementById('condSelTpBook').value)||0;
+            var sl=parseFloat(document.getElementById('condSelSl').value)||0;
+            var slB=parseFloat(document.getElementById('condSelSlBook').value)||0;
+            if(tp===0&&tpB===0&&sl===0&&slB===0){alert('Set at least one threshold');return;}
+            fetch('/api/conditional-close/sel',{method:'POST',headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({ids:ids,tp_usdt:tp>0?tp:null,tp_book:tpB>0?tpB:null,sl_usdt:sl>0?sl:null,sl_book:slB>0?slB:null})})
+            .then(function(r){return r.json();}).then(function(d){
+                if(d.success){condSelActive=true;
+                    document.getElementById('btnCondSelActivate').textContent='DEACTIVATE';
+                    document.getElementById('btnCondSelActivate').style.background='#e74c3c';
+                    var parts=[];
+                    if(tp>0)parts.push('TP: '+tp);if(tpB>0)parts.push('TP Book: '+tpB);if(sl>0)parts.push('SL: -'+sl);if(slB>0)parts.push('SL Book: -'+slB);
+                    document.getElementById('condSelStatus').innerHTML='<span style="color:#f0883e;">ACTIVE: '+d.count+' pos | '+parts.join(' | ')+' USDT</span>';
+                }
+            });
+        }
+        function toggleConditionalAll() {
+            if(condAllActive){
+                fetch('/api/conditional-close/all',{method:'DELETE'}); condAllActive=false;
+                document.getElementById('btnCondAllActivate').textContent='ACTIVATE';
+                document.getElementById('btnCondAllActivate').style.background='#238636';
+                document.getElementById('condAllStatus').textContent=''; return;
+            }
+            var tp=parseFloat(document.getElementById('condAllTp').value)||0;
+            var tpB=parseFloat(document.getElementById('condAllTpBook').value)||0;
+            var sl=parseFloat(document.getElementById('condAllSl').value)||0;
+            var slB=parseFloat(document.getElementById('condAllSlBook').value)||0;
+            if(tp===0&&tpB===0&&sl===0&&slB===0){alert('Set at least one threshold');return;}
+            fetch('/api/conditional-close/all',{method:'POST',headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({tp_usdt:tp>0?tp:null,tp_book:tpB>0?tpB:null,sl_usdt:sl>0?sl:null,sl_book:slB>0?slB:null})})
+            .then(function(r){return r.json();}).then(function(d){
+                if(d.success){condAllActive=true;
+                    document.getElementById('btnCondAllActivate').textContent='DEACTIVATE';
+                    document.getElementById('btnCondAllActivate').style.background='#e74c3c';
+                    var parts=[];
+                    if(tp>0)parts.push('TP: '+tp);if(tpB>0)parts.push('TP Book: '+tpB);if(sl>0)parts.push('SL: -'+sl);if(slB>0)parts.push('SL Book: -'+slB);
+                    document.getElementById('condAllStatus').innerHTML='<span style="color:#f0883e;">ACTIVE: ALL pos | '+parts.join(' | ')+' USDT</span>';
+                }
+            });
+        }
+
+        setInterval(refresh, 5000);
+        refresh();
+    </script>
+</body>
+</html>
+"""
+
+
+FORGOT_HTML = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reset Password</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#c9d1d9;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:40px;width:380px;text-align:center}
+.login-box h2{color:#f0f6fc;margin-bottom:8px;font-size:20px}
+.login-box .question{color:#8b949e;font-size:14px;margin-bottom:20px}
+.login-box input{width:100%;padding:10px 14px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#f0f6fc;font-size:15px;margin-bottom:12px}
+.login-box input:focus{outline:none;border-color:#58a6ff}
+.login-box button{width:100%;padding:10px;background:#238636;color:#fff;border:none;border-radius:6px;font-size:15px;font-weight:600;cursor:pointer}
+.login-box button:hover{background:#2ea043}
+.error{color:#f85149;font-size:13px;margin-bottom:12px}
+.success{color:#3fb950;font-size:13px;margin-bottom:12px}
+a{color:#58a6ff;font-size:13px;text-decoration:none}
+</style></head>
+<body><div class="login-box"><h2>Reset Password</h2>
+<div class="question">{{ question }}</div>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+{% if success %}<div class="success">{{ success }}</div><a href="/login">Back to login</a>
+{% else %}
+<form method="POST"><input type="text" name="answer" placeholder="Your answer" autofocus>
+<input type="password" name="new_password" placeholder="New password">
+<input type="password" name="confirm_password" placeholder="Confirm new password">
+<button type="submit">Reset Password</button></form>
+<div style="margin-top:16px"><a href="/login">Back to login</a></div>
+{% endif %}
+</div></body></html>"""
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#c9d1d9;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:40px;width:340px;text-align:center}
+.login-box h2{color:#f0f6fc;margin-bottom:24px;font-size:20px}
+.login-box input{width:100%;padding:10px 14px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#f0f6fc;font-size:15px;margin-bottom:16px}
+.login-box input:focus{outline:none;border-color:#58a6ff}
+.login-box button{width:100%;padding:10px;background:#238636;color:#fff;border:none;border-radius:6px;font-size:15px;font-weight:600;cursor:pointer}
+.login-box button:hover{background:#2ea043}
+.error{color:#f85149;font-size:13px;margin-bottom:12px}
+</style></head>
+<body><div class="login-box"><h2>Crypto Dashboard</h2>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+<form method="POST"><input type="password" name="password" placeholder="Password" autofocus>
+<button type="submit">Login</button></form><div style="margin-top:16px"><a href="/forgot" style="color:#58a6ff;font-size:13px;text-decoration:none">Forgot password?</a></div></div></body></html>"""
+
+def create_app(config: dict):
+    app = Flask(__name__)
+
+    app.secret_key = config.get("dashboard", {}).get("password", "") + "_secret_key_2026"
+
+    @app.after_request
+    def add_no_cache(response):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+    dashboard_password = config.get("dashboard", {}).get("password", "")
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        error = None
+        if request.method == "POST":
+            if request.form.get("password") == dashboard_password:
+                session["authenticated"] = True
+                return redirect("/")
+            error = "Wrong password"
+        return render_template_string(LOGIN_HTML, error=error)
+
+    @app.route("/logout")
+    def logout():
+        session.pop("authenticated", None)
+        return redirect("/login")
+
+    @app.before_request
+    def require_auth():
+        if not dashboard_password:
+            return
+        if request.endpoint in ("login", "forgot_password", "static", "api_internal_add_position"):
+            return
+        if request.endpoint and request.endpoint.startswith("api_") and request.remote_addr in ("127.0.0.1", "::1"):
+            return
+        if not session.get("authenticated"):
+            return redirect("/login")
+
+    security_question = config.get("dashboard", {}).get("security_question", "")
+    security_answer = config.get("dashboard", {}).get("security_answer", "")
+
+    @app.route("/forgot", methods=["GET", "POST"])
+    def forgot_password():
+        error = None
+        success = None
+        if request.method == "POST":
+            answer = request.form.get("answer", "").strip().lower()
+            new_pw = request.form.get("new_password", "")
+            confirm_pw = request.form.get("confirm_password", "")
+            if answer != security_answer.lower():
+                error = "Wrong answer"
+            elif len(new_pw) < 4:
+                error = "Password must be at least 4 characters"
+            elif new_pw != confirm_pw:
+                error = "Passwords do not match"
+            else:
+                nonlocal dashboard_password
+                dashboard_password = new_pw
+                config["dashboard"]["password"] = new_pw
+                cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+                try:
+                    with open(cfg_path, "w") as cf:
+                        import json as _json
+                        _json.dump(config, cf, indent=4)
+                except Exception:
+                    pass
+                success = "Password changed successfully!"
+                logger.info("Password changed via security question")
+        return render_template_string(FORGOT_HTML, question=security_question, error=error, success=success)
+
+    executor = BinanceExecutor(
+        api_key=config.get("trading", {}).get("binance_api_key", ""),
+        api_secret=config.get("trading", {}).get("binance_api_secret", ""),
+        rest_url=config.get("binance", {}).get("rest_url", "https://api.binance.com"),
+        api_key_2=config.get("trading", {}).get("binance_api_key_2", ""),
+        api_secret_2=config.get("trading", {}).get("binance_api_secret_2", "")
+    )
+
+    manager = StealthManager(executor)
+    if manager.positions:
+        manager.start_monitoring()
+
+    cond_sel = {"active": False, "ids": [], "tp_usdt": None, "tp_book": None, "sl_usdt": None, "sl_book": None, "triggered": None}
+    cond_all = {"active": False, "tp_usdt": None, "tp_book": None, "sl_usdt": None, "sl_book": None, "triggered": None}
+
+    @app.route("/")
+    def index():
+        return render_template_string(DASHBOARD_HTML)
+
+    @app.route("/api/data")
+    def api_data():
+        data = manager.get_data()
+        triggered_list = []
+        if cond_sel.get("triggered"):
+            triggered_list.append(cond_sel["triggered"]); cond_sel["triggered"] = None
+        if cond_all.get("triggered"):
+            triggered_list.append(cond_all["triggered"]); cond_all["triggered"] = None
+
+        def _check_cond(rule, positions):
+            invested = sum(p["invested_usdt"] for p in positions)
+            pnl = sum(p["pnl_usdt"] for p in positions)
+            book_pnl = sum(p["book_real_pnl"] for p in positions if p.get("book_avg", 0) > 0)
+            if not book_pnl: book_pnl = pnl
+            tp = rule.get("tp_usdt")
+            if tp and pnl >= tp: return "TP", pnl
+            tp_b = rule.get("tp_book")
+            if tp_b and book_pnl >= tp_b: return "TP Book", book_pnl
+            sl = rule.get("sl_usdt")
+            if sl and pnl <= -sl: return "SL", pnl
+            sl_b = rule.get("sl_book")
+            if sl_b and book_pnl <= -sl_b: return "SL Book", book_pnl
+            return None, 0
+
+        if cond_sel.get("active") and data["positions"]:
+            sel_ids = set(cond_sel.get("ids", []))
+            sel_pos = [p for p in data["positions"] if p["id"] in sel_ids]
+            if sel_pos:
+                reason, val = _check_cond(cond_sel, sel_pos)
+                if reason:
+                    closed = 0
+                    for p in sel_pos:
+                        r = manager.close_position(p["id"])
+                        if r: closed += 1
+                        logger.info(f"COND SEL {reason}: {p['asset']} closed")
+                    cond_sel.update({"active": False, "ids": []})
+                    trig = {"mode": "sel", "reason": reason, "value": val, "closed": closed}
+                    cond_sel["triggered"] = trig; triggered_list.append(trig)
+                    data = manager.get_data()
+
+        if cond_all.get("active") and data["positions"]:
+            reason, val = _check_cond(cond_all, data["positions"])
+            if reason:
+                closed = 0
+                for p in data["positions"]:
+                    r = manager.close_position(p["id"])
+                    if r: closed += 1
+                    logger.info(f"COND ALL {reason}: {p['asset']} closed")
+                cond_all["active"] = False
+                trig = {"mode": "all", "reason": reason, "value": val, "closed": closed}
+                cond_all["triggered"] = trig; triggered_list.append(trig)
+                data = manager.get_data()
+
+        if triggered_list:
+            data["conditional_triggered"] = triggered_list
+        data["quota"] = executor.get_quota_info()
+        import json as _json
+        _alert_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sell_alerts.json")
+        try:
+            with open(_alert_file, "r") as _af:
+                data["sell_alerts"] = _json.load(_af)
+        except Exception:
+            data["sell_alerts"] = []
+        return jsonify(data)
+
+    @app.route("/api/internal/add-position", methods=["POST"])
+    def api_internal_add_position():
+        if request.remote_addr not in ("127.0.0.1", "::1"):
+            return jsonify({"error": "forbidden"}), 403
+        data = request.get_json() or {}
+        try:
+            pos = manager.add_position(
+                coin=data["coin"],
+                quantity=float(data["quantity"]),
+                entry_price=float(data["entry_price"]),
+                tp_pct=float(data.get("tp_pct", 50)),
+                sl_pct=float(data.get("sl_pct", 20)),
+                tp_price=float(data.get("tp_price", 0)),
+                sl_price=float(data.get("sl_price", 0)),
+                tp_amount=float(data.get("tp_amount", 0)),
+                sl_amount=float(data.get("sl_amount", 0)),
+                stop_minutes=float(data.get("stop_minutes", 0)),
+                buy_currency=data.get("buy_currency", "USDC")
+            )
+            return jsonify({"status": "ok", "position": pos})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+    @app.route("/api/position", methods=["POST"])
+    def api_add_position():
+        data = request.get_json() or {}
+        try:
+            pos = manager.add_position(
+                coin=data["coin"],
+                quantity=float(data["quantity"]),
+                entry_price=float(data["entry_price"]),
+                tp_pct=float(data.get("tp_pct", 0)),
+                sl_pct=float(data.get("sl_pct", 0)),
+                tp_price=float(data.get("tp_price", 0)),
+                sl_price=float(data.get("sl_price", 0)),
+                tp_amount=float(data.get("tp_amount", 0)),
+                sl_amount=float(data.get("sl_amount", 0)),
+                stop_minutes=float(data.get("stop_minutes", 0)),
+                buy_currency=data.get("buy_currency", "USDC")
+            )
+            return jsonify({"status": "ok", "position": pos})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+    @app.route("/api/position/<pid>", methods=["PUT"])
+    def api_update_position(pid):
+        data = request.get_json() or {}
+        try:
+            pos = manager.update_position(
+                pid,
+                tp_pct=data.get("tp_pct"),
+                sl_pct=data.get("sl_pct"),
+                tp_price=data.get("tp_price"),
+                sl_price=data.get("sl_price"),
+                tp_amount=data.get("tp_amount"),
+                sl_amount=data.get("sl_amount"),
+                enabled=data.get("enabled"),
+                stop_minutes=data.get("stop_minutes")
+            )
+            if pos is None:
+                return jsonify({"error": "Position not found"}), 404
+            return jsonify({"status": "ok", "position": pos})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+    @app.route("/api/position/<pid>", methods=["DELETE"])
+    def api_remove_position(pid):
+        if manager.remove_position(pid):
+            return jsonify({"status": "ok"})
+        return jsonify({"error": "Position not found"}), 404
+
+    @app.route("/api/position/<pid>/close", methods=["POST"])
+    def api_close_position(pid):
+        result = manager.close_position(pid)
+        if result is None:
+            return jsonify({"error": "Position not found"}), 404
+        if isinstance(result, dict) and result.get("error"):
+            return jsonify({"error": f"Binance sell failed: {result['error']}"}), 400
+        return jsonify({"status": "ok", "closed": result})
+
+    @app.route("/api/close-all", methods=["POST"])
+    def api_close_all():
+        results = manager.close_all_positions()
+        sold = [r for r in results if not (isinstance(r, dict) and r.get("error"))]
+        failed = [r for r in results if isinstance(r, dict) and r.get("error")]
+        if failed and not sold:
+            return jsonify({"error": f"All {len(failed)} sells failed", "details": failed}), 400
+        msg = f"{len(sold)} sold on Binance"
+        if failed:
+            msg += f", {len(failed)} failed"
+        return jsonify({"status": "ok", "closed": len(sold), "failed": len(failed), "message": msg})
+
+    @app.route("/api/internal/close-all", methods=["POST"])
+    def api_internal_close_all():
+        results = manager.close_all_positions()
+        sold = [r for r in results if not (isinstance(r, dict) and r.get("error"))]
+        failed = [r for r in results if isinstance(r, dict) and r.get("error")]
+        total_pnl = sum(r.get("pnl_usdt", 0) for r in sold if isinstance(r, dict))
+        return jsonify({"success": True, "closed": len(sold), "failed": len(failed), "total_pnl": round(total_pnl, 2)})
+
+    @app.route("/api/close-selected", methods=["POST"])
+    def api_close_selected():
+        data = request.get_json() or {}
+        ids = data.get("ids", [])
+        if not ids:
+            return jsonify({"error": "No positions selected"}), 400
+        closed = 0
+        failed = 0
+        for pid in ids:
+            r = manager.close_position(pid)
+            if r and isinstance(r, dict) and r.get("error"):
+                failed += 1
+            elif r:
+                closed += 1
+        if failed and not closed:
+            return jsonify({"error": f"All {failed} sells failed on Binance"}), 400
+        msg = f"{closed} closed"
+        if failed:
+            msg += f", {failed} failed"
+        return jsonify({"status": "ok", "closed": closed, "failed": failed, "message": msg})
+
+    @app.route("/api/conditional-close/sel", methods=["POST"])
+    def set_cond_sel():
+        data = request.get_json() or {}
+        ids = data.get("ids", [])
+        if not ids: return jsonify({"success": False, "error": "No positions"}), 400
+        cond_sel.update({"active": True, "ids": ids, "tp_usdt": data.get("tp_usdt"), "tp_book": data.get("tp_book"), "sl_usdt": data.get("sl_usdt"), "sl_book": data.get("sl_book"), "triggered": None})
+        logger.info(f"COND SEL SET: {len(ids)} pos")
+        return jsonify({"success": True, "count": len(ids)})
+
+    @app.route("/api/conditional-close/sel", methods=["DELETE"])
+    def clear_cond_sel():
+        cond_sel.update({"active": False, "ids": [], "tp_usdt": None, "tp_book": None, "sl_usdt": None, "sl_book": None, "triggered": None})
+        return jsonify({"success": True})
+
+    @app.route("/api/conditional-close/all", methods=["POST"])
+    def set_cond_all():
+        data = request.get_json() or {}
+        cond_all.update({"active": True, "tp_usdt": data.get("tp_usdt"), "tp_book": data.get("tp_book"), "sl_usdt": data.get("sl_usdt"), "sl_book": data.get("sl_book"), "triggered": None})
+        logger.info("COND ALL SET")
+        return jsonify({"success": True})
+
+    @app.route("/api/conditional-close/all", methods=["DELETE"])
+    def clear_cond_all():
+        cond_all.update({"active": False, "tp_usdt": None, "tp_book": None, "sl_usdt": None, "sl_book": None, "triggered": None})
+        return jsonify({"success": True})
+
+    @app.route("/api/conditional-close/status", methods=["GET"])
+    def get_cond_status():
+        return jsonify({
+            "sel": {"active": cond_sel["active"], "ids": cond_sel.get("ids", []), "count": len(cond_sel.get("ids", [])),
+                    "tp_usdt": cond_sel["tp_usdt"], "tp_book": cond_sel["tp_book"], "sl_usdt": cond_sel["sl_usdt"], "sl_book": cond_sel["sl_book"]},
+            "all": {"active": cond_all["active"],
+                    "tp_usdt": cond_all["tp_usdt"], "tp_book": cond_all["tp_book"], "sl_usdt": cond_all["sl_usdt"], "sl_book": cond_all["sl_book"]}
+        })
+
+    @app.route("/api/trade-mode", methods=["POST"])
+    def api_trade_mode():
+        if not session.get("authenticated"):
+            return jsonify({"error": "unauthorized"}), 401
+        data = request.get_json() or {}
+        direction = data.get("direction")
+        mode = data.get("mode")
+        if mode not in ("convert_usdc", "usdc_only"):
+            return jsonify({"error": "invalid mode"}), 400
+        if direction == "buy":
+            executor.buy_mode = mode
+        elif direction == "sell":
+            executor.sell_mode = mode
+        elif direction == "both":
+            executor.buy_mode = mode
+            executor.sell_mode = mode
+        else:
+            return jsonify({"error": "invalid direction"}), 400
+        executor._save_trade_modes()
+        label = "Convert+USDC" if mode == "convert_usdc" else "Only USDC"
+        logger.info(f"Trade mode changed: {direction} -> {label}")
+        return jsonify({"ok": True, "buy_mode": executor.buy_mode, "sell_mode": executor.sell_mode})
+
+    return app
+
+
+def main():
+    config_path = os.path.join(DATA_DIR, "config.json")
+    with open(config_path) as f:
+        config = json.load(f)
+
+    port = config.get("dashboard", {}).get("port", 5061)
+    app = create_app(config)
+
+    logger.info(f"Starting Stealth TP/SL Manager on port {port}")
+    logger.info("NO Binance API used for monitoring - only public WebSocket")
+    logger.info("API key only used when executing sell orders")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
+
+if __name__ == "__main__":
+    main()

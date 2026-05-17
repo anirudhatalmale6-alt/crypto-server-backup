@@ -1,0 +1,12 @@
+{
+  "Setting 1": {
+    "threshold": 30,
+    "window_minutes": 15,
+    "take_profit": 50,
+    "stop_loss": 20,
+    "amount": 1500,
+    "max_simultaneous": 2,
+    "top_n": 290,
+    "double_bottom": "off"
+  }
+}

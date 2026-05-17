@@ -1,0 +1,15 @@
+[Unit]
+Description=Crypto Live Trading 7082
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-paper-7082
+ExecStart=/opt/crypto-paper-7082/venv/bin/python3 main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/crypto-paper-7082/crypto-alert.log
+StandardError=append:/opt/crypto-paper-7082/crypto-alert.log
+
+[Install]
+WantedBy=multi-user.target

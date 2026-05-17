@@ -1,0 +1,5 @@
+flask==3.1.0
+websockets==13.1
+requests==2.32.3
+python-telegram-bot==21.9
+aiohttp==3.11.11

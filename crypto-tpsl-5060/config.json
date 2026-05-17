@@ -1,0 +1,17 @@
+{
+    "binance": {
+        "rest_url": "https://api.binance.com",
+        "ws_url": "wss://stream.binance.com:9443/ws",
+        "quote_asset": "USDT"
+    },
+    "trading": {
+        "mode": "live",
+        "binance_api_key": "pSYSSq4D7GHN8yYlo6IzTkQYPDEJvIYyhJBGlZJ3OJ4ZbQuck44eX6lxrAcnoFpI",
+        "binance_api_secret": "Oco2EY918FezrYzj2OUxplVlrO3k7bkd2FnrtFUcGYMircrViabLOonsNjsMFPAM"
+    },
+    "dashboard": {
+        "host": "0.0.0.0",
+        "port": 5060,
+        "debug": false
+    }
+}

@@ -1,0 +1,32 @@
+{
+  "2026-05-05": {
+    "eur_max_simul": 5,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 0,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-06": {
+    "eur_max_simul": 5,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 0,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-11": {
+    "eur_max_simul": 4,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 0,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  }
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=Crypto Paper Trading 9010 (LIVE - 900s window)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-paper-9010
+ExecStart=/opt/crypto-paper-9010/venv/bin/python /opt/crypto-paper-9010/main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

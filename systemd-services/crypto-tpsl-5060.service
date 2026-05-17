@@ -1,0 +1,15 @@
+[Unit]
+Description=Crypto Hidden TP/SL Manager 5060
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-tpsl-5060
+ExecStart=/opt/crypto-tpsl-5060/venv/bin/python3 position_manager.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/crypto-tpsl-5060/tpsl.log
+StandardError=append:/opt/crypto-tpsl-5060/tpsl.log
+
+[Install]
+WantedBy=multi-user.target

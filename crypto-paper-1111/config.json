@@ -1,0 +1,138 @@
+{
+  "binance": {
+    "rest_url": "https://api.binance.com",
+    "ws_url": "wss://stream.binance.com:9443/ws",
+    "top_pairs_count": 300,
+    "quote_asset": "USDT"
+  },
+  "detection": {
+    "drop_threshold_percent": 99999.0,
+    "time_windows_minutes": [
+      15
+    ],
+    "price_check_interval_seconds": 1,
+    "pump_detection": false,
+    "pump_threshold_percent": 5.0,
+    "pump_window_seconds": 600,
+    "pump_only": false,
+    "volume_pump_mode": true,
+    "volume_spike_multiplier": 3.0,
+    "orderbook_buy_ratio": 1.5,
+    "orderbook_check_seconds": 5
+  },
+  "alerts": {
+    "sound_enabled": false,
+    "telegram_enabled": false
+  },
+  "trading": {
+    "enabled": true,
+    "mode": "demo",
+    "amount_per_trade_eur": 10.0,
+    "take_profit_percent": 50.0,
+    "stop_loss_percent": 20.0,
+    "reversal_mode": "instant",
+    "max_simultaneous_trades": 100,
+    "max_duration_hours": 2.0,
+    "pump_tp_percent": 30.0,
+    "pump_sl_percent": 10.0,
+    "binance_api_key": "pSYSSq4D7GHN8yYlo6IzTkQYPDEJvIYyhJBGlZJ3OJ4ZbQuck44eX6lxrAcnoFpI",
+    "binance_api_secret": "Oco2EY918FezrYzj2OUxplVlrO3k7bkd2FnrtFUcGYMircrViabLOonsNjsMFPAM",
+    "binance_api_key_2": "tZrY9oTyxZL8BooPv8WJabkqG9fYAIN3RSqi4dOfT8F8IASpR23W5QM2DbwQFAnb",
+    "binance_api_secret_2": "PiOUGbMX61Ur76RPs853FlgKi84zfsP2CPJmfxexc7Mbo31vGpBBKkZ3lLrZc5yS"
+  },
+  "dashboard": {
+    "host": "0.0.0.0",
+    "port": 1111,
+    "debug": false,
+    "password": "guidoleb@@11"
+  },
+  "database": {
+    "path": "multi_strategy.db"
+  },
+  "strategies": {
+    "ST-9000": {
+      "name": "Strategy 9000",
+      "tp_percent": 50.0,
+      "sl_percent": 20.0,
+      "trade_amount": 10.0,
+      "pump_tp_percent": 30.0,
+      "pump_sl_percent": 10.0,
+      "max_trades": 100,
+      "max_duration_hours": 2.0,
+      "volume_spike_multiplier": 3.0,
+      "orderbook_buy_ratio": 1.5,
+      "pump_window_seconds": 600,
+      "active": true
+    },
+    "ST-9001": {
+      "name": "Strategy 9001",
+      "tp_percent": 50.0,
+      "sl_percent": 20.0,
+      "trade_amount": 10.0,
+      "pump_tp_percent": 30.0,
+      "pump_sl_percent": 10.0,
+      "max_trades": 100,
+      "max_duration_hours": 2.0,
+      "volume_spike_multiplier": 3.0,
+      "orderbook_buy_ratio": 1.5,
+      "pump_window_seconds": 600,
+      "active": false
+    },
+    "ST-9002": {
+      "name": "Strategy 9002",
+      "tp_percent": 50.0,
+      "sl_percent": 20.0,
+      "trade_amount": 10.0,
+      "pump_tp_percent": 30.0,
+      "pump_sl_percent": 10.0,
+      "max_trades": 100,
+      "max_duration_hours": 2.0,
+      "volume_spike_multiplier": 3.0,
+      "orderbook_buy_ratio": 1.5,
+      "pump_window_seconds": 600,
+      "active": false
+    },
+    "ST-9010": {
+      "name": "Strategy 9010",
+      "tp_percent": 50.0,
+      "sl_percent": 20.0,
+      "trade_amount": 10.0,
+      "pump_tp_percent": 30.0,
+      "pump_sl_percent": 10.0,
+      "max_trades": 100,
+      "max_duration_hours": 2.0,
+      "volume_spike_multiplier": 3.0,
+      "orderbook_buy_ratio": 1.5,
+      "pump_window_seconds": 600,
+      "active": false
+    },
+    "ST-9011": {
+      "name": "Strategy 9011",
+      "tp_percent": 50.0,
+      "sl_percent": 20.0,
+      "trade_amount": 10.0,
+      "pump_tp_percent": 30.0,
+      "pump_sl_percent": 10.0,
+      "max_trades": 100,
+      "max_duration_hours": 2.0,
+      "volume_spike_multiplier": 3.0,
+      "orderbook_buy_ratio": 1.5,
+      "pump_window_seconds": 600,
+      "active": false
+    },
+    "ST-9012": {
+      "name": "Strategy 9012",
+      "tp_percent": 50.0,
+      "sl_percent": 20.0,
+      "trade_amount": 10.0,
+      "pump_tp_percent": 30.0,
+      "pump_sl_percent": 10.0,
+      "max_trades": 100,
+      "max_duration_hours": 2.0,
+      "volume_spike_multiplier": 3.0,
+      "orderbook_buy_ratio": 1.5,
+      "pump_window_seconds": 600,
+      "active": false
+    }
+  }
+}

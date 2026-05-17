@@ -1,0 +1,14 @@
+[Unit]
+Description=Crypto Demo Trading 9001 (Sentinel Pump)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-paper-9001
+ExecStart=/opt/crypto-paper-9001/venv/bin/python /opt/crypto-paper-9001/main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

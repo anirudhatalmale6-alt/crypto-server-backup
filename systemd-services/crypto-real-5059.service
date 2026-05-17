@@ -1,0 +1,16 @@
+[Unit]
+Description=Crypto Real Trading - Port 5059
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-real-5059
+ExecStart=/opt/crypto-real-5059/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/crypto-real-5059/crypto-real.log
+StandardError=append:/opt/crypto-real-5059/crypto-real.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

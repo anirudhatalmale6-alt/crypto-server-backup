@@ -1,0 +1,15 @@
+[Unit]
+Description=Crypto Paper Trading 8012
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-paper-8012
+ExecStart=/opt/crypto-paper-8012/venv/bin/python3 main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/crypto-paper-8012/crypto-alert.log
+StandardError=append:/opt/crypto-paper-8012/crypto-alert.log
+
+[Install]
+WantedBy=multi-user.target

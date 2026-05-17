@@ -1,0 +1,1053 @@
+"""
+Comparison Dashboard - Port 9999
+Shows daily P&L stats for all trading ports in a spreadsheet-like table.
+"""
+from flask import Flask, jsonify, request
+import sqlite3
+import os
+import json
+import subprocess
+import requests as req
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+DEFAULT_START = "2026-05-07 05:00:00"
+DAY_START_HOUR = 5
+
+app = Flask(__name__)
+
+PORTS = [7081, 5065, 8010, 8011, 8012, 8082, 8083, 8084, 7071, 7072, 8090, 8091, 8092, 8093, 8094, 8095, 8096, 8097, 8098, 8099, 9000, 9001, 9002, 9003, 9010, 9011, 9012]
+
+_skip_cache = {}
+_skip_cache_ts = {}
+def count_skip_events(port, start_date=None):
+    """Count skip events from log files with daily breakdown (cached 30s)."""
+    import time
+    cache_key = f"{port}_{start_date}"
+    now = time.time()
+    if cache_key in _skip_cache and now - _skip_cache_ts.get(cache_key, 0) < 30:
+        return _skip_cache[cache_key]
+    if port == 5065:
+        log_path = "/opt/crypto-stealth-5061/stealth_tpsl.log"
+    else:
+        log_path = f"/opt/crypto-paper-{port}/crash_detector.log"
+    result = {"skip_rate_limit": 0, "skip_no_pair": 0, "skip_max_trades": 0, "daily_skips": {}}
+    if not os.path.exists(log_path):
+        _skip_cache[cache_key] = result
+        _skip_cache_ts[cache_key] = now
+        return result
+    try:
+        cmd = f"grep -n '418\|429\|rate.limit\|not available\|MAX TRADES REACHED' '{log_path}'"
+        if start_date:
+            date_prefix = start_date[:10]
+            cmd = f"sed -n '/{date_prefix}/,$p' '{log_path}' | grep '418\|429\|rate.limit\|not available\|MAX TRADES REACHED'"
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        daily = {}
+        for line in r.stdout.splitlines():
+            day = line[:10] if len(line) > 10 else ""
+            if len(day) != 10 or day[4] != '-':
+                continue
+            if day not in daily:
+                daily[day] = {"skip_rate_limit": 0, "skip_no_pair": 0, "skip_max_trades": 0}
+            if '418' in line or '429' in line or 'rate limit' in line.lower():
+                daily[day]["skip_rate_limit"] += 1
+                result["skip_rate_limit"] += 1
+            elif 'not available' in line:
+                daily[day]["skip_no_pair"] += 1
+                result["skip_no_pair"] += 1
+            elif 'MAX TRADES REACHED' in line:
+                daily[day]["skip_max_trades"] += 1
+                result["skip_max_trades"] += 1
+        result["daily_skips"] = daily
+    except Exception:
+        pass
+    _skip_cache[cache_key] = result
+    _skip_cache_ts[cache_key] = now
+    return result
+
+_actual_pnl_cache = {}
+_actual_pnl_ts = {}
+_actual_inv_cache = {}
+def get_actual_pnl(port):
+    """Fetch unrealized P&L from port API (cached 10s)."""
+    import time
+    now = time.time()
+    if port in _actual_pnl_cache and now - _actual_pnl_ts.get(port, 0) < 10:
+        return _actual_pnl_cache[port]
+    val = 0
+    inv = 0
+    try:
+        if port == 5065:
+            r = req.get("http://127.0.0.1:5065/api/data", timeout=3)
+        else:
+            r = req.get(f"http://127.0.0.1:{port}/api/data", timeout=3)
+        d = r.json()
+        p = d.get("portfolio", {})
+        val = round(p.get("unrealized_pnl", 0) or 0, 2)
+        inv = round(p.get("total_invested", 0) or 0, 2)
+    except Exception:
+        pass
+    _actual_pnl_cache[port] = val
+    _actual_pnl_ts[port] = now
+    _actual_inv_cache[port] = inv
+    return val
+
+def get_frozen_ports():
+    frozen = set()
+    for port in PORTS:
+        if port == 5065:
+            svc = 'crypto-stealth-5061'
+        else:
+            svc = f'crypto-paper-{port}'
+        try:
+            r = subprocess.run(['systemctl', 'is-active', svc], capture_output=True, text=True, timeout=3)
+            if r.stdout.strip() != 'active':
+                frozen.add(port)
+        except Exception:
+            frozen.add(port)
+    return list(frozen)
+
+def get_db_path(port):
+    if port == 5065:
+        return "/opt/crypto-stealth-5061/stealth.db"
+    return f"/opt/crypto-paper-{port}/paper_{port}.db"
+
+def get_config(port):
+    try:
+        path = "/opt/crypto-stealth-5061/config.json" if port == 5065 else f"/opt/crypto-paper-{port}/config.json"
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def query_port(port, start_date=None):
+    if port == 5065:
+        try:
+            pos_path = "/opt/crypto-stealth-5061/stealth_positions.json"
+            closed_path = "/opt/crypto-stealth-5061/stealth_closed.json"
+            positions = json.load(open(pos_path)) if os.path.exists(pos_path) else {}
+            closed = json.load(open(closed_path)) if os.path.exists(closed_path) else []
+            open_count = len(positions)
+            open_live = open_count
+            open_1111 = 0
+            open_demo = 0
+            from datetime import datetime, timedelta
+            _60m_ago = (datetime.utcnow() - timedelta(minutes=60)).strftime('%Y-%m-%d %H:%M:%S')
+            open_last_60m = sum(1 for p in positions.values() if p.get('entry_time', '') >= _60m_ago)
+            total_invested = sum(p.get("invested_usdt", 0) for p in positions.values())
+            avg_amount = round(total_invested / open_count, 2) if open_count else 0
+            if start_date:
+                closed = [c for c in closed if c.get("exit_time", "") >= start_date]
+            total_closed = len(closed)
+            total_pnl = round(sum(c.get("pnl_usdt", 0) for c in closed), 2)
+            wins = sum(1 for c in closed if c.get("pnl_usdt", 0) > 0)
+            losses = total_closed - wins
+            win_rate = round(wins / total_closed * 100, 1) if total_closed > 0 else 0
+            daily = {}
+            for c in closed:
+                day = c.get("exit_time", "")[:10]
+                if day:
+                    if day not in daily:
+                        daily[day] = {"pnl": 0, "trades": 0, "wins": 0, "losses": 0, "win_rate": 0, "max_sim": 0, "max_capital": 0}
+                    daily[day]["pnl"] = round(daily[day]["pnl"] + c.get("pnl_usdt", 0), 2)
+                    daily[day]["trades"] += 1
+                    if c.get("pnl_usdt", 0) > 0:
+                        daily[day]["wins"] += 1
+                    else:
+                        daily[day]["losses"] += 1
+                    daily[day]["win_rate"] = round(daily[day]["wins"] / daily[day]["trades"] * 100, 1)
+            actual_pnl = get_actual_pnl(5065)
+            skips = count_skip_events(5065, start_date)
+            for sk_day, sk_vals in skips.get("daily_skips", {}).items():
+                if sk_day not in daily:
+                    daily[sk_day] = {"pnl": 0, "trades": 0, "wins": 0, "losses": 0, "win_rate": 0, "max_sim": 0, "max_capital": 0}
+                daily[sk_day]["skip_rate_limit"] = sk_vals.get("skip_rate_limit", 0)
+                daily[sk_day]["skip_no_pair"] = sk_vals.get("skip_no_pair", 0)
+                daily[sk_day]["skip_max_trades"] = sk_vals.get("skip_max_trades", 0)
+            return {
+                "port": 5065,
+                "mode": "stealth",
+                "amount": avg_amount,
+                "window": 0,
+                "total_pnl": total_pnl,
+                "total_closed": total_closed,
+                "open_count": open_count,
+            "open_live": open_live,
+            "open_1111": open_1111,
+            "open_demo": open_demo,
+            "open_last_60m": open_last_60m,
+                "max_open_history": max(open_count, total_closed),
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate,
+                "max_simultaneous": open_count,
+                "max_capital": round(total_invested, 0),
+                "daily": daily,
+                "actual_pnl": actual_pnl,
+                "invested": _actual_inv_cache.get(5065, 0),
+                "skip_rate_limit": skips["skip_rate_limit"],
+                "skip_no_pair": skips["skip_no_pair"],
+                "skip_max_trades": skips["skip_max_trades"]
+            }
+        except Exception:
+            return {"port": 5065, "mode": "stealth", "amount": 0, "window": 0,
+                    "total_pnl": 0, "total_closed": 0, "open_count": 0, "open_live": 0, "open_1111": 0, "open_demo": 0, "open_last_60m": 0,
+                    "max_open_history": 0, "wins": 0, "losses": 0,
+                    "win_rate": 0, "max_simultaneous": 0, "max_capital": 0, "daily": {}}
+    db = get_db_path(port)
+    if not os.path.exists(db):
+        return None
+    try:
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+
+        cfg = get_config(port)
+        amount = cfg.get("trading", {}).get("amount_per_trade_eur", 0)
+        mode = cfg.get("trading", {}).get("mode", "demo")
+        window = cfg.get("detection", {}).get("pump_window_seconds", 0)
+
+        date_filter = ""
+        params = []
+        if start_date:
+            date_filter = " AND exit_time_str >= ?"
+            params = [start_date]
+
+        row = conn.execute("""
+            SELECT
+                COUNT(*) as total_closed,
+                COALESCE(SUM(pnl_eur), 0) as total_pnl,
+                COALESCE(SUM(CASE WHEN pnl_eur > 0 THEN 1 ELSE 0 END), 0) as wins,
+                COALESCE(SUM(CASE WHEN pnl_eur <= 0 THEN 1 ELSE 0 END), 0) as losses
+            FROM trades WHERE status='CLOSED'""" + date_filter, params).fetchone()
+
+        total_closed = row["total_closed"]
+        total_pnl = round(row["total_pnl"], 2)
+        wins = row["wins"]
+        losses = row["losses"]
+        win_rate = round(wins / total_closed * 100, 1) if total_closed > 0 else 0
+
+        open_count = conn.execute("SELECT COUNT(*) as c FROM trades WHERE status='OPEN'").fetchone()["c"]
+        open_live = conn.execute("SELECT COUNT(*) as c FROM trades WHERE status='OPEN' AND is_live=1 AND (trade_mode IS NULL OR trade_mode='live')").fetchone()["c"]
+        open_1111 = conn.execute("SELECT COUNT(*) as c FROM trades WHERE status='OPEN' AND trade_mode='live_1111'").fetchone()["c"]
+        open_demo = open_count - open_live - open_1111
+
+        from datetime import datetime, timedelta
+        _60m_ago = (datetime.utcnow() - timedelta(minutes=60)).strftime('%Y-%m-%d %H:%M:%S')
+        open_last_60m = conn.execute("SELECT COUNT(*) as c FROM trades WHERE status='OPEN' AND entry_time_str >= ?", [_60m_ago]).fetchone()['c']
+
+        max_open_history = open_count
+
+        days = conn.execute("""
+            SELECT
+                DATE(exit_time_str, '-5 hours') as day,
+                COUNT(*) as trades,
+                ROUND(SUM(pnl_eur), 2) as pnl,
+                SUM(CASE WHEN pnl_eur > 0 THEN 1 ELSE 0 END) as w,
+                SUM(CASE WHEN pnl_eur <= 0 THEN 1 ELSE 0 END) as l
+            FROM trades
+            WHERE status='CLOSED' AND exit_time_str IS NOT NULL""" + date_filter + """
+            GROUP BY DATE(exit_time_str, '-5 hours')
+            ORDER BY day
+        """, params).fetchall()
+
+        day_max_sim = {}
+        try:
+            sim_q = """
+                SELECT DATE(t1.entry_time_str, '-5 hours') as day,
+                    MAX((SELECT COUNT(*) FROM trades t2
+                        WHERE t2.entry_time <= t1.entry_time
+                        AND (t2.exit_time IS NULL OR t2.exit_time > t1.entry_time)
+                    )) as mx
+                FROM trades t1
+                WHERE t1.id % 50 = 0"""
+            sim_p = []
+            if start_date:
+                sim_q += " AND t1.entry_time_str >= ?"
+                sim_p = [start_date]
+            sim_q += " GROUP BY DATE(t1.entry_time_str, '-5 hours')"
+            for r in conn.execute(sim_q, sim_p).fetchall():
+                day_max_sim[r["day"]] = r["mx"] or 0
+        except Exception:
+            pass
+
+        daily = {}
+        for d in days:
+            wr = round(d["w"] / d["trades"] * 100, 1) if d["trades"] > 0 else 0
+            ms = day_max_sim.get(d["day"], 0)
+            mc = ms * amount
+            daily[d["day"]] = {
+                "pnl": d["pnl"],
+                "trades": d["trades"],
+                "wins": d["w"],
+                "losses": d["l"],
+                "win_rate": wr,
+                "max_sim": ms,
+                "max_capital": round(mc, 0)
+            }
+
+        sim_filter = " AND entry_time_str >= ?" if start_date else ""
+        sim_params = [start_date] if start_date else []
+        max_sim = conn.execute("""
+            SELECT MAX(oc) as mx FROM (
+                SELECT (SELECT COUNT(*) FROM trades t2
+                    WHERE t2.entry_time <= t1.entry_time
+                    AND (t2.exit_time IS NULL OR t2.exit_time > t1.entry_time)
+                ) as oc
+                FROM trades t1 WHERE id % 100 = 0""" + sim_filter + """
+            )
+        """, sim_params).fetchone()["mx"] or 0
+
+        max_capital = max_sim * amount
+        max_open_history = max(open_count, max_sim)
+
+        conn.close()
+        actual_pnl = get_actual_pnl(port)
+        skips = count_skip_events(port, start_date)
+        for sk_day, sk_vals in skips.get("daily_skips", {}).items():
+            if sk_day not in daily:
+                daily[sk_day] = {"pnl": 0, "trades": 0, "wins": 0, "losses": 0, "win_rate": 0, "max_sim": 0, "max_capital": 0}
+            daily[sk_day]["skip_rate_limit"] = sk_vals.get("skip_rate_limit", 0)
+            daily[sk_day]["skip_no_pair"] = sk_vals.get("skip_no_pair", 0)
+            daily[sk_day]["skip_max_trades"] = sk_vals.get("skip_max_trades", 0)
+        return {
+            "port": port,
+            "mode": mode,
+            "amount": amount,
+            "window": window,
+            "total_pnl": total_pnl,
+            "total_closed": total_closed,
+            "open_count": open_count,
+            "open_live": open_live,
+            "open_1111": open_1111,
+            "open_demo": open_demo,
+            "open_last_60m": open_last_60m,
+            "max_open_history": max_open_history,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "max_simultaneous": max_sim,
+            "max_capital": round(max_capital, 0),
+            "daily": daily,
+            "actual_pnl": actual_pnl,
+            "invested": _actual_inv_cache.get(port, 0),
+            "skip_rate_limit": skips["skip_rate_limit"],
+            "skip_no_pair": skips["skip_no_pair"],
+            "skip_max_trades": skips["skip_max_trades"]
+        }
+    except Exception as e:
+        cfg = get_config(port)
+        return {
+            "port": port,
+            "mode": cfg.get("trading", {}).get("mode", "demo"),
+            "amount": cfg.get("trading", {}).get("amount_per_trade_eur", 0),
+            "window": cfg.get("detection", {}).get("pump_window_seconds", 0),
+            "total_pnl": 0, "total_closed": 0, "open_count": 0, "open_live": 0, "open_1111": 0, "open_demo": 0, "open_last_60m": 0,
+            "max_open_history": 0, "wins": 0, "losses": 0,
+            "win_rate": 0, "max_simultaneous": 0, "max_capital": 0,
+            "daily": {}
+        }
+
+
+@app.route("/")
+def index():
+    return HTML
+
+LIVE_PORTS = [9000, 9010, 9012]
+
+@app.route("/api/portfolio")
+def api_portfolio():
+    total_invested = 0
+    total_unrealized = 0
+    total_realized = 0
+    usdc_balance = None
+    port_details = []
+    binance_total_eur = 0
+    binance_holdings = []
+    usdc_portfolio = 0
+    usdc_inv = 0
+    usdc_avl = 0
+    eur_invested = 0
+    eur_free = 0
+    for port in LIVE_PORTS:
+        try:
+            r = req.get(f"http://127.0.0.1:{port}/api/data", timeout=5)
+            d = r.json()
+            p = d.get("portfolio", {})
+            inv = p.get("total_invested", 0) or 0
+            unr = p.get("unrealized_pnl", 0) or 0
+            rea = p.get("realized_pnl", 0) or 0
+            opn = d.get("portfolio", {}).get("open_count", 0) or 0
+            total_invested += inv
+            total_unrealized += unr
+            total_realized += rea
+            if d.get("usdc_balance") is not None:
+                usdc_balance = d["usdc_balance"]
+            if d.get("binance_total_eur") and not binance_total_eur:
+                binance_total_eur = d["binance_total_eur"]
+                binance_holdings = d.get("binance_holdings", [])
+                usdc_portfolio = d.get("usdc_portfolio", 0)
+                usdc_inv = d.get("usdc_invested", 0)
+                usdc_avl = d.get("usdc_available", 0)
+                eur_invested = d.get("eur_invested", 0)
+                eur_free = d.get("eur_free", 0)
+            cfg = get_config(port)
+            max_trades = cfg.get("trading", {}).get("max_simultaneous_trades", 300)
+            amount = cfg.get("trading", {}).get("amount_per_trade_eur", 10)
+            planned = max_trades * amount
+            port_details.append({
+                "port": port,
+                "invested": round(inv, 2),
+                "unrealized": round(unr, 4),
+                "realized": round(rea, 4),
+                "open_trades": opn,
+                "max_trades": max_trades,
+                "amount": amount,
+                "planned": round(planned, 2)
+            })
+        except Exception:
+            pass
+    usdc_inv = round(total_invested + total_unrealized, 2)
+    usdc_avl = round(usdc_balance or 0, 2)
+    usdc_portfolio = round(usdc_inv + usdc_avl, 2)
+    total_portfolio = (usdc_balance or 0) + total_invested + total_unrealized
+    total_planned = sum(p["planned"] for p in port_details)
+    return jsonify({
+        "usdc_balance": usdc_balance,
+        "total_invested": round(total_invested, 2),
+        "total_unrealized": round(total_unrealized, 4),
+        "total_realized": round(total_realized, 4),
+        "total_portfolio": round(total_portfolio, 2),
+        "total_planned": round(total_planned, 2),
+        "ports": port_details,
+        "binance_total_eur": binance_total_eur,
+        "binance_holdings": binance_holdings,
+        "usdc_portfolio": usdc_portfolio,
+        "usdc_invested": usdc_inv,
+        "usdc_available": usdc_avl,
+        "eur_invested": eur_invested,
+        "eur_free": eur_free
+    })
+
+
+_NOTES_DIR = "/opt/crypto-paper-9999/notes"
+os.makedirs(_NOTES_DIR, exist_ok=True)
+
+@app.route("/api/port-notes/<int:port>")
+def api_port_notes(port):
+    try:
+        fpath = os.path.join(_NOTES_DIR, f"{port}.txt")
+        text = ""
+        if os.path.exists(fpath):
+            with open(fpath, "r") as f:
+                text = f.read()
+        return jsonify({"port": port, "notes": text})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/port-notes/<int:port>", methods=["POST"])
+def save_port_notes(port):
+    try:
+        data = request.get_json()
+        fpath = os.path.join(_NOTES_DIR, f"{port}.txt")
+        with open(fpath, "w") as f:
+            f.write(data.get("notes", ""))
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/emergency-close-all", methods=["POST"])
+def api_emergency_close_all():
+    """Close all REAL Binance positions via 5065 stealth system (sells to USDC, convert fallback)."""
+    try:
+        r = req.post("http://127.0.0.1:5065/api/internal/close-all", timeout=120)
+        d = r.json()
+        return jsonify({
+            "success": True,
+            "total_closed": d.get("closed", 0),
+            "total_failed": d.get("failed", 0),
+            "total_pnl": d.get("total_pnl", 0),
+            "ports": {"5065": {"closed": d.get("closed", 0), "pnl": d.get("total_pnl", 0)}}
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/port-close-all/<int:port>", methods=["POST"])
+def api_port_close_all(port):
+    try:
+        url = f"http://127.0.0.1:{port}/api/close-all"
+        r = req.post(url, timeout=10)
+        return jsonify(r.json())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/port-close-conditioned/<int:port>", methods=["POST"])
+def api_port_close_conditioned(port):
+    """Close ALL positions when combined P/L reaches TP or SL threshold."""
+    try:
+        data = request.get_json(force=True) or {}
+        tp_abs = float(data.get("tp_abs", 0))
+        sl_abs = float(data.get("sl_abs", 0))
+        r = req.get(f"http://127.0.0.1:{port}/api/data", timeout=5)
+        d = r.json()
+        trades = d.get("open_trades", [])
+        if not trades:
+            return jsonify({"success": False, "error": "No open trades"})
+        total_pnl = 0
+        for t in trades:
+            entry = t.get("entry_price", 0)
+            current = t.get("current_price", 0)
+            qty = t.get("quantity", 0)
+            if entry > 0 and current > 0:
+                total_pnl += (current - entry) * qty
+        total_pnl = round(total_pnl, 2)
+        should_close = False
+        reason = ""
+        if tp_abs > 0 and total_pnl >= tp_abs:
+            should_close = True
+            reason = f"TP reached: combined P/L {total_pnl} >= {tp_abs}"
+        elif sl_abs > 0 and total_pnl <= -sl_abs:
+            should_close = True
+            reason = f"SL reached: combined P/L {total_pnl} <= -{sl_abs}"
+        if not should_close:
+            return jsonify({"success": True, "closed": 0, "total_pnl": total_pnl,
+                           "message": f"Condition not met. Combined P/L: {total_pnl}. TP: +{tp_abs}, SL: -{sl_abs}"})
+        cr = req.post(f"http://127.0.0.1:{port}/api/close-all", timeout=30)
+        cd = cr.json()
+        return jsonify({"success": True, "closed": cd.get("closed", 0), "failed": cd.get("failed", 0),
+                       "total_pnl": total_pnl, "reason": reason})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/port-config/<int:port>")
+def api_port_config(port):
+    try:
+        cfg = get_config(port)
+        t = cfg.get("trading", {})
+        invested = 0
+        open_count = 0
+        try:
+            r2 = req.get(f"http://127.0.0.1:{port}/api/data", timeout=3)
+            d2 = r2.json()
+            p2 = d2.get("portfolio", {})
+            invested = p2.get("total_invested", 0) or 0
+            open_count = p2.get("open_count", 0) or 0
+        except Exception:
+            pass
+        return jsonify({
+            "port": port,
+            "tp": t.get("take_profit_percent", t.get("pump_tp_percent", 0)),
+            "sl": t.get("stop_loss_percent", t.get("pump_sl_percent", 0)),
+            "amount": t.get("amount_per_trade_eur", 0),
+            "max_trades": t.get("max_simultaneous_trades", 0),
+            "mode": t.get("mode", "demo"),
+            "invested": round(invested, 2),
+            "open_count": open_count
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/data")
+def api_data():
+    start = request.args.get("start", DEFAULT_START)
+    results = []
+    all_days = set()
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(query_port, port, start_date=start): port for port in PORTS}
+        for future in as_completed(futures):
+            data = future.result()
+            if data:
+                results.append(data)
+                if "daily" in data:
+                    all_days.update(data["daily"].keys())
+    results.sort(key=lambda x: PORTS.index(x.get("port", 0)) if x.get("port", 0) in PORTS else 999)
+    frozen = get_frozen_ports()
+    return jsonify({
+        "ports": results,
+        "days": sorted(all_days),
+        "start_date": start,
+        "frozen_ports": frozen
+    })
+
+HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Strategy Comparison Dashboard</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0d1117; color: #c9d1d9; font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; }
+.header { background: #161b22; padding: 12px 20px; border-bottom: 1px solid #30363d; display: flex; align-items: center; justify-content: space-between; }
+.header h1 { font-size: 16px; color: #58a6ff; }
+.header .refresh { color: #8b949e; font-size: 11px; }
+.container { padding: 15px; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; min-width: 800px; }
+th { background: #161b22; color: #8b949e; font-size: 11px; text-transform: uppercase; padding: 8px 6px; border: 1px solid #21262d; position: sticky; top: 0; z-index: 10; white-space: nowrap; }
+td { padding: 6px; border: 1px solid #21262d; text-align: right; white-space: nowrap; }
+
+td.port { text-align: left; font-weight: 700; color: #58a6ff; background: #161b22; position: sticky; left: 0; z-index: 5; }
+td.total { font-weight: 700; background: #161b22; }
+.pos { color: #3fb950; }
+.neg { color: #f85149; }
+.zero { color: #8b949e; }
+.day-header { background: #1c2333; color: #58a6ff; font-weight: 700; text-align: center; }
+.sub-header { background: #161b22; color: #8b949e; font-size: 10px; text-align: center; }
+tr:hover td { background: #1c2128; }
+tr:hover td.port { background: #1c2128; }
+tr:hover td.total { background: #1c2128; }
+.live { color: #f0883e; font-weight: 700; }
+.summary { margin: 15px 0; display: flex; gap: 15px; flex-wrap: wrap; }
+.summary-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; min-width: 150px; }
+.summary-card .label { color: #8b949e; font-size: 10px; text-transform: uppercase; }
+.summary-card .value { font-size: 18px; font-weight: 700; margin-top: 4px; }
+.totals-row td { background: #1c2333 !important; font-weight: 700; border-top: 2px solid #58a6ff; }
+
+.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:100;justify-content:center;align-items:center}
+.modal-overlay.open{display:flex}
+.modal{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:24px;width:480px;max-height:85vh;overflow-y:auto}
+.modal h2{color:#58a6ff;font-size:16px;margin-bottom:16px;border-bottom:1px solid #30363d;padding-bottom:8px}
+.modal-btns{display:flex;gap:10px;margin-top:16px;justify-content:flex-end}
+.modal-btns button{padding:8px 20px;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit}
+.btn-save{background:#238636;color:#fff}
+.btn-save:hover{background:#2ea043}
+.btn-cancel{background:#21262d;color:#c9d1d9}
+.btn-cancel:hover{background:#30363d}
+td.port{cursor:pointer}
+td.port:hover{text-decoration:underline}
+
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>Strategy Comparison Dashboard</h1><button id="emergencyBtn" onclick="emergencyCloseAll()" style="background:#b91c1c;color:#fff;border:2px solid #f85149;border-radius:6px;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;text-transform:uppercase;letter-spacing:1px">CLOSE ALL TRADES</button>
+    <div style="display:flex;align-items:center;gap:12px">
+        <label style="color:#8b949e;font-size:11px">From: <input type="datetime-local" id="startDate" value="2026-05-07T05:00" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;padding:4px 8px;border-radius:4px;font-family:inherit;font-size:12px"></label>
+        <div class="refresh" id="status">Loading...</div>
+    </div>
+</div>
+<div class="container">
+    <div class="summary" id="portfolio" style="margin-bottom:5px"></div>
+    <div class="summary" id="summary"></div>
+    <div id="tableContainer"></div>
+</div>
+<script>
+function pnlClass(v) { return v > 0 ? 'pos' : v < 0 ? 'neg' : 'zero'; }
+function fmt(v, d) { return v !== undefined && v !== null ? Number(v).toFixed(d || 2) : '--'; }
+
+async function refresh() {
+    try {
+        let sd = document.getElementById('startDate').value.replace('T', ' ') + ':00';
+        let r = await fetch('/api/data?start=' + encodeURIComponent(sd) + '&t=' + Date.now());
+        let data = await r.json();
+        render(data);
+        document.getElementById('status').textContent = 'Updated: ' + new Date().toLocaleTimeString() + ' (live 5s)';
+    } catch(e) {
+        document.getElementById('status').textContent = 'Error: ' + e.message;
+    }
+}
+
+function render(data) {
+    let ports = data.ports;
+    let days = data.days;
+
+    let totalPnl = ports.reduce((s, p) => s + (p.total_pnl || 0), 0);
+    let bestPort = ports.reduce((best, p) => (!best || (p.total_pnl || 0) > (best.total_pnl || 0)) ? p : best, null);
+    let totalTrades = ports.reduce((s, p) => s + (p.total_closed || 0), 0);
+    let totalCapital = ports.reduce((s, p) => s + (p.max_capital || 0), 0);
+
+    let sh = '';
+    sh += '<div class="summary-card"><div class="label">Total Profit All Ports</div><div class="value ' + pnlClass(totalPnl) + '">' + fmt(totalPnl) + ' USDT</div></div>';
+    sh += '<div class="summary-card"><div class="label">Best Port</div><div class="value" style="color:#58a6ff">' + (bestPort ? bestPort.port : '--') + ' (' + fmt(bestPort ? bestPort.total_pnl : 0) + ')</div></div>';
+    sh += '<div class="summary-card"><div class="label">Total Trades</div><div class="value">' + totalTrades + '</div></div>';
+    sh += '<div class="summary-card"><div class="label">Active Days</div><div class="value">' + days.length + '</div></div>';
+    document.getElementById('summary').innerHTML = sh;
+
+    let h = '<table><thead><tr>';
+    h += '<th style="position:sticky;left:0;z-index:15;min-width:60px">Port</th>';
+    h += '<th>Mode</th>';
+    h += '<th>Window</th>';
+    h += '<th>Amount</th>';
+    h += '<th style="min-width:80px">Total P&L</th>';
+    h += '<th style="min-width:80px;color:#58a6ff">Actual P/L</th>';
+    h += '<th style="color:#58a6ff">Invested</th>';
+    h += '<th>Trades</th>';
+    h += '<th>Open</th>';
+    h += '<th>Live</th>';
+    h += '<th>1111</th>';
+    h += '<th>Demo</th>';
+    h += '<th style="color:#c9d1d9">Last 60m</th>';
+    h += '<th>Max Pos. History</th>';
+    h += '<th>Max Sim</th>';
+    h += '<th>Max Capital</th>';
+    h += '<th>% P&L/Capital</th>';
+    h += '<th>Win%</th>';
+    h += '<th style="color:#f85149">Skip 1200</th>';
+    h += '<th style="color:#e3b341">Skip NoPair</th>';
+    h += '<th style="color:#a371f7">Skip MaxTrd</th>';
+
+    days.forEach(d => {
+        let parts = d.split('-');
+        let label = parts[2] + '/' + parts[1];
+        h += '<th colspan="8" class="day-header">' + label + '</th>';
+    });
+    h += '</tr><tr>';
+    h += '<th style="position:sticky;left:0;z-index:15"></th>';
+    h += '<th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th><th></th>';
+    days.forEach(() => {
+        h += '<th class="sub-header">P&L</th><th class="sub-header">Trades</th><th class="sub-header">Win%</th><th class="sub-header">Max Capital</th><th class="sub-header">%P&L/Cap</th><th class="sub-header" style="color:#f85149">Sk1200</th><th class="sub-header" style="color:#e3b341">SkPair</th><th class="sub-header" style="color:#a371f7">SkMax</th>';
+    });
+    h += '</tr></thead><tbody>';
+
+    let dayTotals = {};
+    days.forEach(d => { dayTotals[d] = { pnl: 0, trades: 0, wins: 0, losses: 0, max_capital: 0 }; });
+
+    ports.forEach(p => {
+        if (p.error) return;
+        let modeClass = p.mode === 'live' ? ' live' : '';
+        let pctCapital = p.max_capital > 0 ? (p.total_pnl / p.max_capital * 100) : 0;
+        var rowStyle = (p.mode === 'live' || p.mode === 'live_1111') ? ' style="font-style:italic;text-decoration:underline"' : '';
+        h += '<tr' + rowStyle + '>';
+        var isFrozen = (data.frozen_ports || []).indexOf(p.port) >= 0;
+        var sqColor = isFrozen ? '#6e7681' : '#3fb950';
+        h += '<td class="port' + modeClass + '" onclick="openModal(' + p.port + ')">' + '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:' + sqColor + ';margin-right:6px;vertical-align:middle' + (isFrozen ? ';opacity:0.7' : '') + '" title="' + (isFrozen ? 'FROZEN' : 'ACTIVE') + '"></span>' + p.port + (p.port == 9003 ? ' DATA FEED' : '') + (isFrozen ? ' <span style="font-size:9px;color:#6e7681;font-weight:400">[FROZEN]</span>' : '') + '</td>';
+        var curMode = p.mode || 'demo';
+        var modeLabel = curMode === 'live_1111' ? 'LIVE 1111' : curMode === 'stealth' ? 'STEALTH' : curMode.toUpperCase();
+        h += '<td style="cursor:pointer"' + (curMode === 'live' || curMode === 'live_1111' ? ' class="live"' : '') + ' onclick="openPortDash(' + p.port + ')">' + modeLabel + '</td>';
+        h += '<td>' + (p.window || '--') + 's</td>';
+        h += '<td>' + fmt(p.amount, 0) + '</td>';
+        h += '<td class="total ' + pnlClass(p.total_pnl) + '">' + fmt(p.total_pnl) + '</td>';
+        var apnl = p.actual_pnl || 0;
+        var apInv = p.invested || 0;
+        var apPct = apInv > 0 ? (apnl / apInv * 100).toFixed(2) : '0.00';
+        var apBg = apnl > 0 ? '#238636' : apnl < 0 ? '#b91c1c' : '#21262d';
+        var apTx = apnl > 0 ? '#fff' : apnl < 0 ? '#fff' : '#8b949e';
+        h += '<td style="text-align:center"><span onclick="openPnlModal(' + p.port + ',' + apnl + ',' + apInv + ')" style="cursor:pointer;display:inline-block;background:' + apBg + ';color:' + apTx + ';padding:2px 8px;border-radius:4px;font-weight:700;font-size:11px">' + (apnl >= 0 ? '+' : '') + fmt(apnl) + ' <span style="font-weight:400;font-size:9px;opacity:0.85">(' + apPct + '%)</span></span></td>';
+        h += '<td style="text-align:right;color:#58a6ff">' + fmt(apInv, 0) + '</td>';
+        h += '<td>' + (p.total_closed || 0) + '</td>';
+        h += '<td style="font-size:14px;color:#e3b341">' + (p.open_count || 0) + '</td>';
+        h += '<td style="font-size:14px;font-style:italic;color:' + (p.open_live > 0 ? '#f0883e' : '#e3b341') + '">' + (p.open_live || 0) + '</td>';
+        h += '<td style="color:' + (p.open_1111 > 0 ? '#3fb950' : '#e3b341') + '">' + (p.open_1111 || 0) + '</td>';
+        h += '<td style="color:#e3b341">' + (p.open_demo || 0) + '</td>';
+        h += '<td style="color:#c9d1d9;font-weight:700">' + (p.open_last_60m || 0) + '</td>';
+        h += '<td>' + (p.max_open_history || '--') + '</td>';
+        h += '<td>' + (p.max_simultaneous || '--') + '</td>';
+        h += '<td>' + fmt(p.max_capital, 0) + '</td>';
+        h += '<td class="' + pnlClass(pctCapital) + '">' + fmt(pctCapital, 1) + '%</td>';
+        h += '<td>' + fmt(p.win_rate, 1) + '%</td>';
+        h += '<td style="color:#f85149;font-weight:700">' + (p.skip_rate_limit || 0) + '</td>';
+        h += '<td style="color:#e3b341;font-weight:700">' + (p.skip_no_pair || 0) + '</td>';
+        h += '<td style="color:#a371f7;font-weight:700">' + (p.skip_max_trades || 0) + '</td>';
+
+        days.forEach(d => {
+            let dd = (p.daily || {})[d];
+            if (dd) {
+                let dmc = dd.max_capital || 0;
+                let dayPct = dmc > 0 ? (dd.pnl / dmc * 100) : 0;
+                h += '<td class="' + pnlClass(dd.pnl) + '">' + fmt(dd.pnl) + '</td>';
+                h += '<td>' + dd.trades + '</td>';
+                h += '<td>' + fmt(dd.win_rate, 0) + '%</td>';
+                h += '<td>' + fmt(dmc, 0) + '</td>';
+                h += '<td class="' + pnlClass(dayPct) + '">' + fmt(dayPct, 1) + '%</td>';
+                h += '<td style="color:#f85149">' + (dd.skip_rate_limit || 0) + '</td>';
+                h += '<td style="color:#e3b341">' + (dd.skip_no_pair || 0) + '</td>';
+                h += '<td style="color:#a371f7">' + (dd.skip_max_trades || 0) + '</td>';
+                dayTotals[d].pnl += dd.pnl || 0;
+                dayTotals[d].trades += dd.trades || 0;
+                dayTotals[d].wins += dd.wins || 0;
+                dayTotals[d].losses += dd.losses || 0;
+                dayTotals[d].max_capital += dmc;
+            } else {
+                h += '<td class="zero">--</td><td class="zero">--</td><td class="zero">--</td><td class="zero">--</td><td class="zero">--</td><td class="zero">--</td><td class="zero">--</td><td class="zero">--</td>';
+            }
+        });
+        h += '</tr>';
+    });
+
+    h += '<tr class="totals-row">';
+    h += '<td class="port" style="color:#f0883e">TOTAL</td>';
+    h += '<td></td><td></td><td></td>';
+    h += '<td class="' + pnlClass(totalPnl) + '">' + fmt(totalPnl) + '</td>';
+    var totalActualPnl = ports.reduce((s, p) => s + (p.actual_pnl || 0), 0);
+    var tapBg = totalActualPnl > 0 ? '#238636' : totalActualPnl < 0 ? '#b91c1c' : '#21262d';
+    var tapTx = totalActualPnl > 0 ? '#fff' : totalActualPnl < 0 ? '#fff' : '#8b949e';
+    h += '<td style="text-align:center"><span style="display:inline-block;background:' + tapBg + ';color:' + tapTx + ';padding:2px 8px;border-radius:4px;font-weight:700;font-size:11px">' + fmt(totalActualPnl) + '</span></td>';
+    var totalInvested = ports.reduce((s, p) => s + (p.invested || 0), 0);
+    h += '<td style="text-align:right;color:#58a6ff;font-weight:700">' + fmt(totalInvested, 0) + '</td>';
+    h += '<td>' + totalTrades + '</td>';
+    h += '<td></td><td></td><td></td>';
+    h += '<td>' + fmt(totalCapital, 0) + '</td>';
+    let totalPct = totalCapital > 0 ? (totalPnl / totalCapital * 100) : 0;
+    h += '<td class="' + pnlClass(totalPct) + '">' + fmt(totalPct, 1) + '%</td>';
+    h += '<td></td>';
+    h += '<td></td><td></td><td></td>';
+    days.forEach(d => {
+        let dt = dayTotals[d];
+        let wr = dt.trades > 0 ? (dt.wins / dt.trades * 100) : 0;
+        let dtPct = dt.max_capital > 0 ? (dt.pnl / dt.max_capital * 100) : 0;
+        h += '<td class="' + pnlClass(dt.pnl) + '">' + fmt(dt.pnl) + '</td>';
+        h += '<td>' + dt.trades + '</td>';
+        h += '<td>' + fmt(wr, 0) + '%</td>';
+        h += '<td>' + fmt(dt.max_capital, 0) + '</td>';
+        h += '<td class="' + pnlClass(dtPct) + '">' + fmt(dtPct, 1) + '%</td>';
+        h += '<td></td><td></td><td></td>';
+    });
+    h += '</tr>';
+
+    h += '</tbody></table>';
+    document.getElementById('tableContainer').innerHTML = h;
+}
+
+async function refreshPortfolio() {
+    try {
+        let r = await fetch('/api/portfolio?t=' + Date.now());
+        let d = await r.json();
+        let h = '';
+        var eurRate = d.binance_total_eur > 0 && d.usdc_portfolio > 0 ? (d.usdc_portfolio + (d.eur_invested || 0) + (d.eur_free || 0)) / d.binance_total_eur : 1.18;
+        var totalInvLiveEur = (d.usdc_invested || 0) / eurRate + (d.eur_invested || 0);
+        h += '<div class="summary-card" style="border:1px solid #f0883e"><div class="label" style="color:#f0883e">TOTAL INVESTED LIVE</div><div class="value" style="color:#f0883e">' + fmt(totalInvLiveEur) + ' EUR</div><div style="font-size:10px;color:#8b949e;margin-top:4px">USDC + EUR ports</div></div>';
+        h += '<div class="summary-card"><div class="label">Unrealized P&L</div><div class="value ' + pnlClass(d.total_unrealized) + '">' + fmt(d.total_unrealized, 4) + '</div></div>';
+        h += '<div class="summary-card"><div class="label">Realized P&L</div><div class="value ' + pnlClass(d.total_realized) + '">' + fmt(d.total_realized, 4) + '</div></div>';
+        
+        h += '<div class="summary-card" style="border:2px solid #00d4aa"><div class="label" style="color:#00d4aa;font-size:12px">USDC PORTFOLIO</div><div class="value" style="color:#00d4aa;font-size:20px">' + (d.usdc_portfolio !== undefined && d.usdc_portfolio !== null ? fmt(d.usdc_portfolio) : '--') + ' USDC</div><div style="font-size:10px;color:#8b949e;margin-top:4px">Invested + Free</div></div>';
+        h += '<div class="summary-card" style="border:1px solid #ff6b6b"><div class="label" style="color:#ff6b6b">USDC INVESTED LIVE</div><div class="value" style="color:#ff6b6b">' + (d.usdc_invested !== undefined && d.usdc_invested !== null ? fmt(d.usdc_invested) : '--') + ' USDC</div><div style="font-size:10px;color:#8b949e;margin-top:4px">Ports 9000+9010+9012</div></div>';
+        h += '<div class="summary-card" style="border:1px solid #00ff88"><div class="label" style="color:#00ff88">USDC FREE</div><div class="value" style="color:#00ff88">' + (d.usdc_available !== undefined && d.usdc_available !== null ? fmt(d.usdc_available) : '--') + ' USDC</div><div style="font-size:10px;color:#8b949e;margin-top:4px">Available to trade</div></div>';
+        
+        h += '<div class="summary-card" style="border:1px solid #f0c000"><div class="label" style="color:#f0c000">EURO PORTFOLIO</div><div class="value" style="color:#f0c000;font-size:18px">' + (d.eur_invested !== undefined ? fmt((d.eur_invested || 0) + (d.eur_free || 0)) : '--') + ' EUR</div><div style="font-size:10px;color:#8b949e;margin-top:4px">Port 7081 + free EUR</div></div>';
+        h += '<div class="summary-card" style="border:1px solid #ff6b6b"><div class="label" style="color:#ff6b6b">EURO INVESTED LIVE</div><div class="value" style="color:#ff6b6b">' + (d.eur_invested !== undefined && d.eur_invested !== null ? fmt(d.eur_invested) : '--') + ' EUR</div><div style="font-size:10px;color:#8b949e;margin-top:4px">Port 7081 (live only)</div></div>';
+        h += '<div class="summary-card" style="border:1px solid #00ff88"><div class="label" style="color:#00ff88">EURO FREE</div><div class="value" style="color:#00ff88">' + (d.eur_free !== undefined ? fmt(d.eur_free) : '--') + ' EUR</div><div style="font-size:10px;color:#8b949e;margin-top:4px">Free EUR on Binance</div></div>';
+        
+        h += '<div class="summary-card" style="border:1px solid #f0c000"><div class="label" style="color:#f0c000">Binance Portfolio (EUR)</div><div class="value" style="color:#f0c000;font-size:18px">' + fmt(d.binance_total_eur) + ' EUR</div>';
+        if (d.binance_holdings && d.binance_holdings.length > 0) {
+            var parts = [];
+            for (var i = 0; i < d.binance_holdings.length && i < 5; i++) {
+                var hh = d.binance_holdings[i];
+                parts.push(hh.asset + ': ' + fmt(hh.eur, 0) + ' EUR');
+            }
+            h += '<div style="font-size:10px;color:#8b949e;margin-top:4px">' + parts.join(' | ') + '</div>';
+        }
+        h += '</div>';
+        d.ports.forEach(function(p) {
+            h += '<div class="summary-card"><div class="label">Port ' + p.port + (p.port == 9003 ? ' DATA FEED' : '') + ' (' + p.open_trades + ' open)</div><div class="value">' + fmt(p.invested) + ' USDC</div></div>';
+        });
+        document.getElementById('portfolio').innerHTML = h;
+    } catch(e) { console.error('Portfolio error:', e); }
+}
+
+document.getElementById('startDate').addEventListener('change', refresh);
+refresh();
+refreshPortfolio();
+setInterval(refresh, 5000);
+setInterval(refreshPortfolio, 5000);
+
+var _modalPort = null;
+function emergencyCloseAll() {
+    var btn = document.getElementById('emergencyBtn');
+    btn.disabled = true;
+    btn.textContent = 'LOADING...';
+    btn.style.background = '#6b2121';
+    fetch('/api/portfolio').then(function(r){return r.json();}).then(function(pf) {
+        var eur = (pf.binance_total_eur || 0).toFixed(2);
+        if (!confirm('Do you want to close all? Estimate book value: ' + eur + ' EUR')) { btn.disabled=false; btn.textContent='CLOSE ALL TRADES'; btn.style.background='#b91c1c'; return; }
+        btn.textContent = 'CLOSING...';
+        fetch('/api/emergency-close-all', { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            btn.disabled = false;
+            btn.textContent = 'CLOSE ALL TRADES';
+            btn.style.background = '#b91c1c';
+            if (d.success) {
+                alert('DONE! Closed: ' + d.total_closed + ' trades. Failed: ' + d.total_failed + '. PnL: ' + (d.total_pnl || 0).toFixed(2) + ' USDT');
+                refresh();
+                refreshPortfolio();
+            } else {
+                alert('Error: ' + (d.error || 'unknown'));
+            }
+        }).catch(function(e) {
+            btn.disabled = false;
+            btn.textContent = 'CLOSE ALL TRADES';
+            btn.style.background = '#b91c1c';
+            alert('Connection error: ' + e.message);
+        });
+    }).catch(function(e) {
+        btn.disabled = false;
+        btn.textContent = 'CLOSE ALL TRADES';
+        btn.style.background = '#b91c1c';
+        alert('Error loading portfolio: ' + e.message);
+    });
+}
+function openPortDash(port) { window.open('http://' + location.hostname + ':' + port, '_blank'); }
+function openModal(port) {
+    _modalPort = port;
+    document.getElementById('modalTitle').textContent = 'Port ' + port + ' Notes';
+    document.getElementById('mStatus').textContent = 'Loading...';
+    document.getElementById('mStatus').style.color = '#8b949e';
+    document.getElementById('mNotes').value = '';
+    document.getElementById('portModal').classList.add('open');
+    fetch('/api/port-notes/' + port + '?t=' + Date.now())
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (d.error) { document.getElementById('mStatus').textContent = 'Error: ' + d.error; return; }
+            document.getElementById('mNotes').value = d.notes || '';
+            document.getElementById('mStatus').textContent = '';
+            document.getElementById('mNotes').focus();
+        })
+        .catch(function(e) { document.getElementById('mStatus').textContent = 'Error: ' + e.message; });
+}
+function closeModal() { document.getElementById('portModal').classList.remove('open'); _modalPort = null; }
+function savePortNotes() {
+    if (!_modalPort) return;
+    document.getElementById('mStatus').textContent = 'Saving...';
+    document.getElementById('mStatus').style.color = '#f0883e';
+    fetch('/api/port-notes/' + _modalPort, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({notes: document.getElementById('mNotes').value}) })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (d.success) {
+                document.getElementById('mStatus').textContent = 'Saved!';
+                document.getElementById('mStatus').style.color = '#3fb950';
+                setTimeout(function() { document.getElementById('mStatus').textContent = ''; }, 1500);
+            } else {
+                document.getElementById('mStatus').textContent = 'Error: ' + (d.error || 'unknown');
+                document.getElementById('mStatus').style.color = '#f85149';
+            }
+        })
+        .catch(function(e) {
+            document.getElementById('mStatus').textContent = 'Error: ' + e.message;
+            document.getElementById('mStatus').style.color = '#f85149';
+        });
+}
+
+function openPnlModal(port, pnl, invested) {
+    var modal = document.getElementById('pnlModal');
+    var modalPct = invested > 0 ? (pnl / invested * 100).toFixed(2) : '0.00';
+    document.getElementById('pnlModalTitle').textContent = 'Port ' + port + ' - Actual P/L: ' + (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + ' (' + modalPct + '%)';
+    document.getElementById('pnlModalTitle').style.color = pnl > 0 ? '#3fb950' : pnl < 0 ? '#f85149' : '#8b949e';
+    document.getElementById('pnlStatus').textContent = 'Loading...';
+    document.getElementById('pnlStatus').style.color = '#8b949e';
+    document.getElementById('pnlDetails').innerHTML = '';
+    modal.classList.add('open');
+    fetch('/api/port-config/' + port + '?t=' + Date.now())
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            document.getElementById('pnlStatus').textContent = '';
+            var inv = d.invested || 0;
+            var tpAbs = (inv * d.tp / 100).toFixed(2);
+            var slAbs = (inv * d.sl / 100).toFixed(2);
+            window._pnlInv = inv;
+            var h = '<div style="display:flex;gap:15px;margin:16px 0;flex-wrap:wrap">';
+            h += '<div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 14px;flex:1;min-width:70px"><div style="color:#8b949e;font-size:10px;text-transform:uppercase">Mode</div><div style="font-size:14px;font-weight:700;color:' + (d.mode === 'live' ? '#f0883e' : '#58a6ff') + '">' + (d.mode || 'demo').toUpperCase() + '</div></div>';
+            h += '<div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 14px;flex:1;min-width:70px"><div style="color:#8b949e;font-size:10px;text-transform:uppercase">Invested</div><div style="font-size:14px;font-weight:700;color:#c9d1d9">' + inv.toFixed(2) + '</div><div style="font-size:10px;color:#8b949e">' + d.open_count + ' positions</div></div>';
+            h += '<div style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 14px;flex:1;min-width:70px"><div style="color:#8b949e;font-size:10px;text-transform:uppercase">Amount</div><div style="font-size:14px;font-weight:700;color:#c9d1d9">' + d.amount + '</div></div>';
+            h += '</div>';
+            h += '<div style="display:flex;gap:15px;margin:12px 0">';
+            h += '<div style="background:#0d1117;border:1px solid #238636;border-radius:6px;padding:12px;flex:1">';
+            h += '<div style="color:#3fb950;font-size:11px;font-weight:700;margin-bottom:8px">TAKE PROFIT</div>';
+            h += '<div style="display:flex;gap:8px;align-items:center">';
+            h += '<div><div style="color:#8b949e;font-size:9px">PERCENT</div><input id="pnlTpPct" type="number" step="0.1" value="' + d.tp + '" oninput="tpPctChange()" style="width:65px;background:#161b22;color:#3fb950;border:1px solid #30363d;padding:4px;border-radius:4px;font-size:13px;font-weight:700;font-family:inherit"><span style="color:#8b949e"> %</span></div>';
+            h += '<div><div style="color:#8b949e;font-size:9px">ABSOLUTE</div><input id="pnlTpAbs" type="number" step="0.01" value="' + tpAbs + '" oninput="tpAbsChange()" style="width:85px;background:#161b22;color:#3fb950;border:1px solid #30363d;padding:4px;border-radius:4px;font-size:13px;font-weight:700;font-family:inherit"><span style="color:#8b949e"> USDC</span></div>';
+            h += '</div></div>';
+            h += '<div style="background:#0d1117;border:1px solid #b91c1c;border-radius:6px;padding:12px;flex:1">';
+            h += '<div style="color:#f85149;font-size:11px;font-weight:700;margin-bottom:8px">STOP LOSS</div>';
+            h += '<div style="display:flex;gap:8px;align-items:center">';
+            h += '<div><div style="color:#8b949e;font-size:9px">PERCENT</div><input id="pnlSlPct" type="number" step="0.1" value="' + d.sl + '" oninput="slPctChange()" style="width:65px;background:#161b22;color:#f85149;border:1px solid #30363d;padding:4px;border-radius:4px;font-size:13px;font-weight:700;font-family:inherit"><span style="color:#8b949e"> %</span></div>';
+            h += '<div><div style="color:#8b949e;font-size:9px">ABSOLUTE</div><input id="pnlSlAbs" type="number" step="0.01" value="' + slAbs + '" oninput="slAbsChange()" style="width:85px;background:#161b22;color:#f85149;border:1px solid #30363d;padding:4px;border-radius:4px;font-size:13px;font-weight:700;font-family:inherit"><span style="color:#8b949e"> USDC</span></div>';
+            h += '</div></div>';
+            h += '</div>';
+            h += '<div style="display:flex;gap:10px;margin-top:16px">';
+            h += '<button onclick="closeConditioned(' + port + ')" style="background:#1f6feb;color:#fff;border:2px solid #58a6ff;border-radius:6px;padding:10px 20px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;flex:1">CLOSE CONDITIONED</button>';
+            h += '<button onclick="closeAllPort(' + port + ')" style="background:#b91c1c;color:#fff;border:2px solid #f85149;border-radius:6px;padding:10px 20px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;flex:1">CLOSE ALL IMMEDIATELY</button>';
+            h += '</div>';
+            document.getElementById('pnlDetails').innerHTML = h;
+        })
+        .catch(function(e) { document.getElementById('pnlStatus').textContent = 'Error: ' + e.message; });
+}
+function tpPctChange() { var v = parseFloat(document.getElementById('pnlTpPct').value); document.getElementById('pnlTpAbs').value = (v * window._pnlInv / 100).toFixed(2); }
+function tpAbsChange() { var v = parseFloat(document.getElementById('pnlTpAbs').value); document.getElementById('pnlTpPct').value = window._pnlInv > 0 ? (v / window._pnlInv * 100).toFixed(1) : '0'; }
+function slPctChange() { var v = parseFloat(document.getElementById('pnlSlPct').value); document.getElementById('pnlSlAbs').value = (v * window._pnlInv / 100).toFixed(2); }
+function slAbsChange() { var v = parseFloat(document.getElementById('pnlSlAbs').value); document.getElementById('pnlSlPct').value = window._pnlInv > 0 ? (v / window._pnlInv * 100).toFixed(1) : '0'; }
+
+function closePnlModal() { document.getElementById('pnlModal').classList.remove('open'); }
+function closeConditioned(port) {
+    var tpAbs = parseFloat(document.getElementById('pnlTpAbs').value) || 0;
+    var slAbs = parseFloat(document.getElementById('pnlSlAbs').value) || 0;
+    var tpPct = parseFloat(document.getElementById('pnlTpPct').value) || 0;
+    var slPct = parseFloat(document.getElementById('pnlSlPct').value) || 0;
+    if (tpAbs <= 0 && slAbs <= 0) { alert('Set TP or SL values first'); return; }
+    var msg = 'Close ALL on port ' + port + '? TP: +' + tpAbs + ' USDC / SL: -' + slAbs + ' USDC. Checks combined P/L now.';
+    if (!confirm(msg)) return;
+    document.getElementById('pnlStatus').textContent = 'Checking conditions...';
+    document.getElementById('pnlStatus').style.color = '#f0883e';
+    fetch('/api/port-close-conditioned/' + port, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({tp_abs: tpAbs, sl_abs: slAbs})
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        if (d.error) {
+            document.getElementById('pnlStatus').textContent = 'Error: ' + d.error;
+            document.getElementById('pnlStatus').style.color = '#f85149';
+        } else if (d.closed > 0) {
+            document.getElementById('pnlStatus').textContent = d.reason + '. Closed ' + d.closed + ' positions.';
+            document.getElementById('pnlStatus').style.color = '#3fb950';
+            setTimeout(function() { refresh(); refreshPortfolio(); }, 2000);
+        } else {
+            document.getElementById('pnlStatus').textContent = d.message || 'Condition not met yet.';
+            document.getElementById('pnlStatus').style.color = '#58a6ff';
+        }
+    })
+    .catch(function(e) {
+        document.getElementById('pnlStatus').textContent = 'Error: ' + e.message;
+        document.getElementById('pnlStatus').style.color = '#f85149';
+    });
+}
+function closeAllPort(port) {
+    if (!confirm('Close ALL open positions on port ' + port + '?')) return;
+    document.getElementById('pnlStatus').textContent = 'Closing...';
+    document.getElementById('pnlStatus').style.color = '#f0883e';
+    fetch('/api/port-close-all/' + port, { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            if (d.error) {
+                document.getElementById('pnlStatus').textContent = 'Error: ' + d.error;
+                document.getElementById('pnlStatus').style.color = '#f85149';
+            } else {
+                document.getElementById('pnlStatus').textContent = 'Closed ' + (d.closed || 0) + ' positions. Failed: ' + (d.failed || 0);
+                document.getElementById('pnlStatus').style.color = '#3fb950';
+                setTimeout(function() { refresh(); refreshPortfolio(); }, 2000);
+            }
+        })
+        .catch(function(e) {
+            document.getElementById('pnlStatus').textContent = 'Error: ' + e.message;
+            document.getElementById('pnlStatus').style.color = '#f85149';
+        });
+}
+
+</script>
+
+<div class="modal-overlay" id="portModal" onclick="if(event.target===this)closeModal()">
+<div class="modal" style="width:600px">
+<div style="display:flex;justify-content:space-between;align-items:center"><h2 id="modalTitle" style="margin:0">Port Notes</h2><button onclick="closeModal()" style="background:none;border:none;color:#8b949e;font-size:22px;cursor:pointer;padding:0 4px;line-height:1">&times;</button></div>
+<textarea id="mNotes" style="width:100%;height:400px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:12px;font-family:Consolas,Monaco,monospace;font-size:13px;resize:vertical;line-height:1.5" placeholder="Write your notes here..."></textarea>
+<div class="modal-btns">
+<button class="btn-cancel" onclick="closeModal()">CANCEL</button>
+<button class="btn-save" onclick="savePortNotes()">SAVE</button>
+</div>
+<div class="status" id="mStatus"></div>
+</div>
+</div>
+
+<div class="modal-overlay" id="pnlModal" onclick="if(event.target===this)closePnlModal()">
+<div class="modal" style="width:500px">
+<div style="display:flex;justify-content:space-between;align-items:center"><h2 id="pnlModalTitle" style="margin:0;font-size:16px">Port P/L</h2><button onclick="closePnlModal()" style="background:none;border:none;color:#8b949e;font-size:22px;cursor:pointer;padding:0 4px;line-height:1">&times;</button></div>
+<div id="pnlDetails"></div>
+<div class="status" id="pnlStatus"></div>
+</div>
+</div>
+
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=9999, debug=False)

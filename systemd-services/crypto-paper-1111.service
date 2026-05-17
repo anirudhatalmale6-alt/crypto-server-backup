@@ -1,0 +1,15 @@
+[Unit]
+Description=Crypto Multi-Strategy Dashboard (Port 1111)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/crypto-paper-1111
+ExecStart=/opt/crypto-paper-1111/venv/bin/python /opt/crypto-paper-1111/main.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

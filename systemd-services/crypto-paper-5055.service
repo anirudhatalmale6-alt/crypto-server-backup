@@ -1,0 +1,15 @@
+[Unit]
+Description=Crypto Paper Trading 5055
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-paper-5055
+ExecStart=/opt/crypto-paper-5055/venv/bin/python3 main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/crypto-paper-5055/crypto-alert.log
+StandardError=append:/opt/crypto-paper-5055/crypto-alert.log
+
+[Install]
+WantedBy=multi-user.target

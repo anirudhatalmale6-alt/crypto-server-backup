@@ -1,0 +1,4089 @@
+"""
+dashboard.py - Flask web dashboard for viewing crashes and simulated trades.
+"""
+
+import os
+import time
+import json
+import logging
+from flask import Flask, render_template_string, jsonify, request
+
+from database import Database
+from trader import BinanceTrader
+
+logger = logging.getLogger(__name__)
+FORGOT_HTML = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reset Password</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#c9d1d9;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:40px;width:380px;text-align:center}
+.login-box h2{color:#f0f6fc;margin-bottom:8px;font-size:20px}
+.login-box .question{color:#8b949e;font-size:14px;margin-bottom:20px}
+.login-box input{width:100%;padding:10px 14px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#f0f6fc;font-size:15px;margin-bottom:12px}
+.login-box input:focus{outline:none;border-color:#58a6ff}
+.login-box button{width:100%;padding:10px;background:#238636;color:#fff;border:none;border-radius:6px;font-size:15px;font-weight:600;cursor:pointer}
+.login-box button:hover{background:#2ea043}
+.error{color:#f85149;font-size:13px;margin-bottom:12px}
+.success{color:#3fb950;font-size:13px;margin-bottom:12px}
+a{color:#58a6ff;font-size:13px;text-decoration:none}
+</style></head>
+<body><div class="login-box"><h2>Reset Password</h2>
+<div class="question">{{ question }}</div>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+{% if success %}<div class="success">{{ success }}</div><a href="/login">Back to login</a>
+{% else %}
+<form method="POST"><input type="text" name="answer" placeholder="Your answer" autofocus>
+<input type="password" name="new_password" placeholder="New password">
+<input type="password" name="confirm_password" placeholder="Confirm new password">
+<button type="submit">Reset Password</button></form>
+<div style="margin-top:16px"><a href="/login">Back to login</a></div>
+{% endif %}
+</div></body></html>"""
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#c9d1d9;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:40px;width:340px;text-align:center}
+.login-box h2{color:#f0f6fc;margin-bottom:24px;font-size:20px}
+.login-box input{width:100%;padding:10px 14px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#f0f6fc;font-size:15px;margin-bottom:16px}
+.login-box input:focus{outline:none;border-color:#58a6ff}
+.login-box button{width:100%;padding:10px;background:#238636;color:#fff;border:none;border-radius:6px;font-size:15px;font-weight:600;cursor:pointer}
+.login-box button:hover{background:#2ea043}
+.error{color:#f85149;font-size:13px;margin-bottom:12px}
+</style></head>
+<body><div class="login-box"><h2>Crypto Dashboard</h2>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+<form method="POST"><input type="password" name="password" placeholder="Password" autofocus>
+<button type="submit">Login</button></form><div style="margin-top:16px"><a href="/forgot" style="color:#58a6ff;font-size:13px;text-decoration:none">Forgot password?</a></div></div></body></html>"""
+
+# HTML template for the dashboard
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crypto Crash Detector</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            min-height: 100vh;
+        }
+        .header {
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        .header h1 {
+            font-size: 20px;
+            color: #f0f6fc;
+        }
+        .header .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #3fb950;
+            animation: pulse 2s infinite;
+        }
+        .status-dot.offline { background: #f85149; animation: none; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 16px;
+        }
+        .stat-card .label {
+            font-size: 12px;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
+        }
+        .stat-card .value {
+            font-size: 24px;
+            font-weight: 600;
+            color: #f0f6fc;
+        }
+        .stat-card .value.positive { color: #3fb950; }
+        .stat-card .value.negative { color: #f85149; }
+
+        .section {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            margin-bottom: 24px;
+            overflow: hidden;
+        }
+        .section-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid #30363d;
+            font-size: 14px;
+            font-weight: 600;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .section-header .badge {
+            background: #388bfd26;
+            color: #58a6ff;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        th {
+            text-align: left;
+            padding: 8px 16px;
+            background: #0d1117;
+            color: #8b949e;
+            font-weight: 500;
+            border-bottom: 1px solid #30363d;
+        }
+        td {
+            padding: 10px 16px;
+            border-bottom: 1px solid #21262d;
+        }
+        tr:hover { background: #1c2128; }
+        .pnl-positive { color: #3fb950; font-weight: 600; }
+        .pnl-negative { color: #f85149; font-weight: 600; }
+        .badge-open {
+            background: #388bfd26; color: #58a6ff;
+            padding: 2px 6px; border-radius: 4px; font-size: 11px;
+        }
+        .badge-closed {
+            background: #21262d; color: #8b949e;
+            padding: 2px 6px; border-radius: 4px; font-size: 11px;
+        }
+        .alert-row {
+            background: #f8514922;
+            animation: flash 1s ease-in-out 3;
+        }
+        @keyframes flash {
+            0%, 100% { background: #f8514922; }
+            50% { background: #f8514944; }
+        }
+        .empty-state {
+            padding: 40px;
+            text-align: center;
+            color: #8b949e;
+        }
+        .refresh-note {
+            font-size: 11px;
+            color: #8b949e;
+        }
+        .config-info {
+            font-size: 12px;
+            color: #8b949e;
+            padding: 8px 16px;
+            border-top: 1px solid #21262d;
+        }
+        .settings-panel {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            margin-bottom: 24px;
+            padding: 20px;
+        }
+        .settings-panel h2 {
+            font-size: 16px;
+            color: #f0f6fc;
+            margin-bottom: 16px;
+        }
+        .settings-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .setting-item label {
+            display: block;
+            font-size: 12px;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+        .setting-item input, .setting-item select {
+            width: 100%;
+            padding: 8px 12px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            color: #f0f6fc;
+            font-size: 14px;
+        }
+        .setting-item input:focus, .setting-item select:focus {
+            outline: none;
+            border-color: #58a6ff;
+        }
+        .btn-save {
+            background: #238636;
+            color: #fff;
+            border: none;
+            padding: 8px 24px;
+            border-radius: 6px;
+            font-size: 14px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        .btn-save:hover { background: #2ea043; }
+        .btn-save:disabled { background: #21262d; color: #8b949e; cursor: not-allowed; }
+        .settings-msg {
+            display: inline-block;
+            margin-left: 12px;
+            font-size: 13px;
+            color: #3fb950;
+        }
+        .settings-msg.error { color: #f85149; }
+        [id^="section"] { scroll-margin-top: 70px; }
+        .settings-toggle {
+            cursor: pointer;
+            color: #58a6ff;
+            font-size: 13px;
+            user-select: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Crypto Crash Detector</h1>
+        <div class="status">
+            <div id="tradingBadge" style="display:inline-flex;align-items:center;gap:6px;background:#1a2332;border:1px solid #238636;border-radius:16px;padding:4px 12px;margin-right:8px;font-size:12px;font-weight:600;color:#3fb950">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#3fb950;animation:pulse 1.5s infinite"></span>
+                <span id="tradingModeText">Paper Trading Active</span>
+                <span id="tradingUptime" style="color:#8b949e;font-weight:400;margin-left:4px"></span>
+            </div>
+            <span id="activeConfig" style="font-size:11px;color:#8b949e;margin-right:10px"></span>
+            <a href="#sectionSettings" style="color:#58a6ff;font-size:12px;text-decoration:none;margin-right:10px;padding:3px 8px;border:1px solid #30363d;border-radius:6px" onclick="document.getElementById('settingsBody').style.display='block'">Settings</a>
+            <a href="#sectionResults" style="color:#58a6ff;font-size:12px;text-decoration:none;margin-right:10px;padding:3px 8px;border:1px solid #30363d;border-radius:6px">Results</a>
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">Connecting...</span>
+            <span class="refresh-note">(auto-refresh 5s)</span>
+        </div>
+    </div>
+
+    <div class="container">
+        <!-- Settings Panel -->
+        <div class="settings-panel" id="sectionSettings">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <h2>Settings</h2>
+                <span class="settings-toggle" onclick="toggleSettings()">[ Show / Hide ]</span>
+            </div>
+            <div id="settingsBody">
+                <div class="settings-grid">
+                    <div class="setting-item">
+                        <label>Crash Threshold (%)</label>
+                        <input type="number" id="setThreshold" step="1" min="1" max="99" value="{{ threshold }}">
+                    </div>
+                    <div class="setting-item">
+                        <label>Time Window (minutes)</label>
+                        <input type="text" id="setWindows" value="{{ windows }}" placeholder="e.g. 7, 15">
+                    </div>
+                    <div class="setting-item">
+                        <label>Trade Amount (EUR)</label>
+                        <input type="number" id="setAmount" step="10" min="10" value="{{ amount }}">
+                    </div>
+                    <div class="setting-item">
+                        <label>Take Profit (%)</label>
+                        <input type="number" id="setTP" step="1" min="1" max="500" value="{{ tp }}">
+                    </div>
+                    <div class="setting-item">
+                        <label>Stop Loss (%)</label>
+                        <input type="number" id="setSL" step="1" min="1" max="100" value="{{ sl }}">
+                    </div>
+                    <div class="setting-item">
+                        <label>Trading Mode</label>
+                        <select id="setMode">
+                            <option value="demo" {{ 'selected' if mode == 'demo' else '' }}>DEMO (Paper)</option>
+                            <option value="live" {{ 'selected' if mode == 'live' else '' }}>LIVE (Real Orders)</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label>Entry Strategy</label>
+                        <select id="setEntry">
+                            <option value="instant" {{ 'selected' if entry == 'instant' else '' }}>Instant Buy (at crash)</option>
+                            <option value="reversal" {{ 'selected' if entry == 'reversal' else '' }}>Wait for Reversal</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label>Double Bottom (optional)</label>
+                        <select id="setDoubleBottom">
+                            <option value="off" {{ 'selected' if not dbl_bottom else '' }}>OFF</option>
+                            <option value="on" {{ 'selected' if dbl_bottom else '' }}>ON (+-3%, 120 days)</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label>Pump Detection</label>
+                        <select id="setPump">
+                            <option value="on" {{ 'selected' if pump_on else '' }}>ON</option>
+                            <option value="off" {{ 'selected' if not pump_on else '' }}>OFF</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label>Pump Threshold (%)</label>
+                        <input type="number" id="setPumpThreshold" step="1" min="1" max="50" value="{{ pump_threshold }}">
+                    </div>
+                    <div class="setting-item">
+                        <label>Pump Window (seconds)</label>
+                        <input type="number" id="setPumpWindow" step="1" min="1" max="60" value="{{ pump_window }}">
+                    </div>
+                    <div class="setting-item">
+                        <label>Coins to Monitor</label>
+                        <input type="number" id="setCoins" step="10" min="10" max="500" value="{{ trading_coins }}">
+                    </div>
+                    <div class="setting-item">
+                        <label>Max Trades (EUR)</label>
+                        <input type="number" id="setMaxTrades" step="1" min="0" max="500" value="{{ max_trades }}" title="0 = unlimited">
+                    </div>
+                    <div class="setting-item">
+                        <label>Trade Amount (USDC)</label>
+                        <input type="number" id="setAmountUsdc" step="10" min="10" value="{{ amount_usdc }}">
+                    </div>
+                    <div class="setting-item">
+                        <label>Max Trades (USDC)</label>
+                        <input type="number" id="setMaxUsdc" step="1" min="0" max="500" value="{{ max_usdc_trades }}" title="0 = unlimited">
+                    </div>
+                    <div class="setting-item">
+                        <label>EUR Convert</label>
+                        <select id="chkConvert">
+                            <option value="on" {{ 'selected' if use_convert else '' }}>ON</option>
+                            <option value="off" {{ 'selected' if not use_convert else '' }}>OFF</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label>USDC Spot</label>
+                        <select id="chkUsdc">
+                            <option value="on" {{ 'selected' if use_usdc else '' }}>ON</option>
+                            <option value="off" {{ 'selected' if not use_usdc else '' }}>OFF</option>
+                        </select>
+                    </div>
+                </div>
+                <button class="btn-save" id="btnSave" onclick="saveSettings()">Save Settings</button>
+                <span class="settings-msg" id="settingsMsg"></span>
+            </div>
+        </div>
+
+        <!-- Quota Alert -->
+        <div id="quotaAlert" style="display:none; padding: 10px 16px; border-radius: 6px; color: white; font-weight: bold; margin-bottom: 12px; font-size: 13px;"></div>
+
+        <!-- Stats Grid -->
+        <div class="stats-grid" id="statsGrid">
+            <div class="stat-card">
+                <div class="label">Pairs Monitored</div>
+                <div class="value" id="statPairs">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Crashes (24h)</div>
+                <div class="value" id="statCrashes">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Open Positions</div>
+                <div class="value" id="statOpen">--</div>
+                <div style="font-size:11px;color:#f85149;margin-top:2px;" id="statSkipped"></div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Total Invested</div>
+                <div class="value" id="statInvested">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Unrealized P&L</div>
+                <div class="value" id="statUnrealized">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Realized P&L <span onclick="resetHistory()" style="color:#f85149;cursor:pointer;font-size:10px;margin-left:6px;border:1px solid #f85149;padding:1px 5px;border-radius:3px;">[RESET]</span></div>
+                <div class="value" id="statRealized">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Win Rate</div>
+                <div class="value" id="statWinRate">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Uptime</div>
+                <div class="value" id="statUptime">--</div>
+            </div>
+            <div class="stat-card" style="border-left: 2px solid #238636;">
+                <div class="label">EUR Balance</div>
+                <div class="value" id="statEurBal" style="color:#3fb950;">--</div>
+            </div>
+            <div class="stat-card" style="border-left: 2px solid #1f6feb;">
+                <div class="label">USDC Balance</div>
+                <div class="value" id="statUsdcBal" style="color:#58a6ff;">--</div>
+            </div>
+            <div class="stat-card" style="border-left: 2px solid #a371f7; background: linear-gradient(135deg, #161b22 0%, #1c1438 100%);">
+                <div class="label" style="color:#a371f7;">Total Portfolio</div>
+                <div class="value" id="statPortfolioVal" style="color:#e2c5ff; font-size:16px;">--</div>
+            </div>
+            <div class="stat-card" style="border-left: 2px solid #f0883e;">
+                <div class="label" style="color:#f0883e;">PNL Today</div>
+                <div class="value" id="statPnlToday" style="font-size:16px;">--</div>
+            </div>
+        </div>
+
+        <!-- Portfolio Summary Bar -->
+        <div class="stats-grid" style="margin-top: 8px; grid-template-columns: repeat(5, 1fr) auto;">
+            <div class="stat-card">
+                <div class="label">Open Positions</div>
+                <div class="value" id="sumOpen">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Total Invested</div>
+                <div class="value" id="sumInvested">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Current Value</div>
+                <div class="value" id="sumValue">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Total PnL</div>
+                <div class="value" id="sumPnl">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Total PnL BOOK</div>
+                <div class="value" id="sumPnlBook">--</div>
+            </div>
+            <div class="stat-card" style="display:flex; align-items:center; justify-content:center;">
+                <button onclick="closeAllPositions()" style="background:#e74c3c; color:#fff; border:none; padding:14px 28px; font-size:16px; font-weight:700; cursor:pointer; border-radius:6px; letter-spacing:1px;">CLOSE ALL</button>
+            </div>
+        </div>
+        <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:8px; padding:10px 16px; background:#161b22; border:1px solid #30363d; border-radius:6px;">
+            <span style="color:#c9d1d9;font-size:13px;font-weight:700;margin-right:4px;">CLOSE ALL WHEN</span>
+            <div style="display:flex;align-items:center;gap:4px;">
+                <label style="color:#8b949e;font-size:12px;white-space:nowrap;">TP USDT</label>
+                <input id="condAllTp" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                <span id="condAllTpEur" style="color:#8b949e;font-size:11px;"></span>
+            </div>
+            <div style="display:flex;align-items:center;gap:4px;">
+                <label style="color:#8b949e;font-size:12px;white-space:nowrap;">TP Book USDT</label>
+                <input id="condAllTpBook" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                <span id="condAllTpBookEur" style="color:#8b949e;font-size:11px;"></span>
+            </div>
+            <div style="display:flex;align-items:center;gap:4px;">
+                <label style="color:#8b949e;font-size:12px;white-space:nowrap;">SL USDT</label>
+                <input id="condAllSl" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                <span id="condAllSlEur" style="color:#8b949e;font-size:11px;"></span>
+            </div>
+            <div style="display:flex;align-items:center;gap:4px;">
+                <label style="color:#8b949e;font-size:12px;white-space:nowrap;">SL Book USDT</label>
+                <input id="condAllSlBook" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                <span id="condAllSlBookEur" style="color:#8b949e;font-size:11px;"></span>
+            </div>
+            <button id="btnCondAllActivate" onclick="toggleConditionalAll()" style="background:#238636;color:#fff;border:none;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;border-radius:4px;">ACTIVATE</button>
+            <span id="condAllStatus" style="font-size:12px;color:#8b949e;"></span>
+        </div>
+
+        <!-- Top Drops (Live) -->
+        <div class="section">
+            <div class="section-header">
+                <span>Top Drops Right Now (all coins, live)</span>
+                <span class="badge" id="topDropsCount">0</span>
+            </div>
+            <div id="topDropsTable">
+                <div class="empty-state">Collecting price data... (wait 1-2 minutes after startup)</div>
+            </div>
+        </div>
+
+        <!-- Historical Scanner -->
+        <div class="settings-panel">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <h2>Historical Scanner</h2>
+                <span class="settings-toggle" onclick="toggleHistory()">[ Show / Hide ]</span>
+            </div>
+            <div id="historyBody" style="display:none">
+                <div class="settings-grid">
+                    <div class="setting-item">
+                        <label>Date From</label>
+                        <input type="date" id="histFrom">
+                    </div>
+                    <div class="setting-item">
+                        <label>Date To</label>
+                        <input type="date" id="histTo">
+                    </div>
+                    <div class="setting-item">
+                        <label>Min Drop (%)</label>
+                        <input type="number" id="histThreshold" step="1" min="1" max="99" value="20">
+                    </div>
+                    <div class="setting-item">
+                        <label>Time Window (minutes)</label>
+                        <select id="histWindow">
+                            <option value="5">5 min</option>
+                            <option value="15" selected>15 min</option>
+                            <option value="30">30 min</option>
+                            <option value="60">1 hour</option>
+                            <option value="240">4 hours</option>
+                            <option value="1440">1 day</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label>Top N coins to scan</label>
+                        <input type="number" id="histCount" step="10" min="10" max="500" value="100">
+                    </div>
+                </div>
+                <button class="btn-save" id="btnScan" onclick="scanHistory()">Scan Historical Data</button>
+                <span class="settings-msg" id="histMsg"></span>
+                <div id="histResults" style="margin-top:16px"></div>
+            </div>
+        </div>
+
+        <!-- Backtest -->
+        <div class="settings-panel">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <h2>Strategy Backtest</h2>
+                <span class="settings-toggle" onclick="toggleBacktest()">[ Show / Hide ]</span>
+            </div>
+            <div id="backtestBody" style="display:none">
+                <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+                    <select id="btPreset" style="padding:6px 10px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:4px">
+                        <option value="">-- Presets --</option>
+                    </select>
+                    <button class="btn-save" style="padding:6px 14px;font-size:12px" onclick="loadPreset()">Load</button>
+                    <button class="btn-save" style="padding:6px 14px;font-size:12px;background:#2d6a4f" onclick="savePreset()">Save</button>
+                    <button class="btn-save" style="padding:6px 14px;font-size:12px;background:#c0392b" onclick="deletePreset()">Delete</button>
+                </div>
+                <div class="settings-grid">
+                    <div class="setting-item">
+                        <label>Date From</label>
+                        <input type="date" id="btFrom">
+                    </div>
+                    <div class="setting-item">
+                        <label>Date To</label>
+                        <input type="date" id="btTo">
+                    </div>
+                    <div class="setting-item">
+                        <label>Crash Threshold (%)</label>
+                        <input type="number" id="btThreshold" step="1" min="5" max="80" value="30">
+                    </div>
+                    <div class="setting-item">
+                        <label>Time Window</label>
+                        <select id="btWindow">
+                            <option value="5">5 min</option>
+                            <option value="15" selected>15 min</option>
+                            <option value="60">1 hour</option>
+                            <option value="240">4 hours</option>
+                            <option value="1440">1 day</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label>Take Profit (%)</label>
+                        <input type="number" id="btTP" step="5" min="5" max="500" value="50">
+                    </div>
+                    <div class="setting-item">
+                        <label>Stop Loss (%)</label>
+                        <input type="number" id="btSL" step="5" min="5" max="100" value="20">
+                    </div>
+                    <div class="setting-item">
+                        <label>Max Duration (hours)</label>
+                        <input type="number" id="btMaxDuration" step="1" min="0" max="720" value="0" title="0 = no limit">
+                    </div>
+                    <div class="setting-item">
+                        <label>Trade Amount (EUR)</label>
+                        <input type="number" id="btAmount" step="100" min="100" value="1000">
+                    </div>
+                    <div class="setting-item">
+                        <label>Max Simultaneous Trades</label>
+                        <input type="number" id="btMaxTrades" step="1" min="1" max="500" value="100">
+                    </div>
+                    <div class="setting-item">
+                        <label>Coins to test</label>
+                        <input type="number" id="btCoins" step="10" min="10" max="500" value="100">
+                    </div>
+                    <div class="setting-item">
+                        <label>Double Bottom Filter</label>
+                        <select id="btDoubleBottom">
+                            <option value="off" selected>OFF (all crashes)</option>
+                            <option value="on">ON (only near prev lows)</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label>Pump Detection</label>
+                        <select id="btPumpEnabled">
+                            <option value="off" selected>OFF (crash only)</option>
+                            <option value="on">ON (crash + pump)</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label>Pump TP (%)</label>
+                        <input type="number" id="btPumpTP" step="5" min="1" max="500" value="30">
+                    </div>
+                    <div class="setting-item">
+                        <label>Pump SL (%)</label>
+                        <input type="number" id="btPumpSL" step="5" min="1" max="100" value="10">
+                    </div>
+                    <div class="setting-item">
+                        <label>Backtest Mode</label>
+                        <select id="btMode">
+                            <option value="candle" selected>Candle (fast, all coins)</option>
+                            <option value="hybrid">Hybrid (all coins, tick precision)</option>
+                            <option value="tick">Tick-by-tick (precise, 20 coins)</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label>Pump Threshold (%)</label>
+                        <input type="number" id="btPumpThreshold" step="1" min="1" max="50" value="5">
+                    </div>
+                    <div class="setting-item">
+                        <label>Pump Window (seconds)</label>
+                        <input type="number" id="btPumpWindow" step="1" min="1" max="60" value="5">
+                    </div>
+                    <div class="setting-item">
+                        <label>Coin Range (tick mode)</label>
+                        <select id="btCoinRange">
+                            <option value="0" selected>1-20 (top volume)</option>
+                            <option value="20">21-40</option>
+                            <option value="40">41-60</option>
+                            <option value="60">61-80</option>
+                            <option value="80">81-100</option>
+                            <option value="100">101-120</option>
+                            <option value="120">121-140</option>
+                            <option value="140">141-160</option>
+                            <option value="160">161-180</option>
+                            <option value="180">181-200</option>
+                            <option value="200">201-300</option>
+                            <option value="300">301-500</option>
+                        </select>
+                    </div>
+                </div>
+                <button class="btn-save" id="btnBacktest" onclick="runBacktest()">Run Backtest</button>
+                <button class="btn-save" id="btnPaperTrade" onclick="applyPaperTrading()" style="background:#1f6feb;margin-left:8px">Apply to Paper Trading</button>
+                <span class="settings-msg" id="btMsg"></span>
+                <div id="btSummary" style="margin-top:16px"></div>
+                <div id="btResults" style="margin-top:8px"></div>
+            </div>
+        </div>
+
+        <!-- Daily Trading Journal -->
+        <div class="section">
+            <div class="section-header" onclick="toggleJournal()" style="cursor:pointer">
+                <h2>Daily Trading Journal</h2>
+                <span style="color:#58a6ff; font-size:14px; cursor:pointer;">[ Show / Hide ]</span>
+            </div>
+            <div id="journalBody" style="display:none; padding:16px;">
+                <button onclick="loadJournal()" style="background:#238636;color:#fff;border:none;padding:8px 20px;font-size:14px;cursor:pointer;border-radius:6px;margin-bottom:12px;">Load Journal</button>
+                <div id="journalResults"></div>
+            </div>
+        </div>
+
+        <!-- Active Alerts -->
+        <div class="section">
+            <div class="section-header">
+                <span>Recent Crashes (alerts triggered)</span>
+                <span class="badge" id="crashCount">0</span>
+            </div>
+            <div id="crashTable">
+                <div class="empty-state">No crashes detected yet. Monitoring...</div>
+            </div>
+        </div>
+
+        <!-- Open Trades -->
+        <div class="section" id="sectionResults">
+            <div class="section-header">
+                <span>Open Positions (Paper Trading)</span>
+                <span class="badge" id="openCount">0</span>
+            </div>
+            <div id="openTradesTable">
+                <div class="empty-state">No open positions</div>
+            </div>
+            <div id="selectionBar" style="display:none; margin-top:8px; padding:12px 16px; background:#161b22; border:1px solid #30363d; border-radius:6px; flex-wrap:wrap; align-items:center; gap:10px;">
+                <button onclick="closeSelected()" style="background:#e74c3c;color:#fff;border:none;padding:10px 20px;font-size:14px;font-weight:700;cursor:pointer;border-radius:6px;">CLOSE SELECTED</button>
+                <span id="selSummary" style="font-size:14px;"></span>
+                <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; width:100%; margin-top:6px;">
+                    <span style="color:#c9d1d9;font-size:13px;font-weight:700;margin-right:4px;">CLOSE SELECTED WHEN</span>
+                    <div style="display:flex;align-items:center;gap:4px;">
+                        <label style="color:#8b949e;font-size:12px;white-space:nowrap;">TP USDT</label>
+                        <input id="condSelTp" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                        <span id="condSelTpEur" style="color:#8b949e;font-size:11px;"></span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:4px;">
+                        <label style="color:#8b949e;font-size:12px;white-space:nowrap;">TP Book USDT</label>
+                        <input id="condSelTpBook" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                        <span id="condSelTpBookEur" style="color:#8b949e;font-size:11px;"></span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:4px;">
+                        <label style="color:#8b949e;font-size:12px;white-space:nowrap;">SL USDT</label>
+                        <input id="condSelSl" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                        <span id="condSelSlEur" style="color:#8b949e;font-size:11px;"></span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:4px;">
+                        <label style="color:#8b949e;font-size:12px;white-space:nowrap;">SL Book USDT</label>
+                        <input id="condSelSlBook" type="number" step="0.01" min="0" style="width:70px;padding:4px 6px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;font-size:12px;" placeholder="0">
+                        <span id="condSelSlBookEur" style="color:#8b949e;font-size:11px;"></span>
+                    </div>
+                    <button id="btnCondSelActivate" onclick="toggleConditionalSel()" style="background:#238636;color:#fff;border:none;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;border-radius:4px;">ACTIVATE</button>
+                    <span id="condSelStatus" style="font-size:12px;color:#8b949e;"></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Closed Trades -->
+        <div class="section">
+            <div class="section-header">
+                <span>Trade History</span>
+                <span class="badge" id="closedCount">0</span>
+            </div>
+            <div id="closedTradesTable">
+                <div class="empty-state">No completed trades</div>
+            </div>
+        </div>
+
+        <div class="config-info">
+            Detection: {{ threshold }}%+ drop within {{ windows }} min |
+            Trade size: EUR {{ amount }} |
+            TP: {{ tp }}% | SL: {{ sl }}%
+        </div>
+    </div>
+
+    <script>
+        var prevTradeCount = -1;
+        var prevClosedCount = -1;
+        var lastEurRate = 0;
+        function playAlert(type) {
+            try {
+                var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                if (type === 'buy') {
+                    [800, 1000, 1200].forEach(function(freq, i) {
+                        var osc = ctx.createOscillator();
+                        var gain = ctx.createGain();
+                        osc.connect(gain);
+                        gain.connect(ctx.destination);
+                        osc.frequency.value = freq;
+                        osc.type = 'sine';
+                        gain.gain.value = 0.3;
+                        osc.start(ctx.currentTime + i * 0.15);
+                        osc.stop(ctx.currentTime + i * 0.15 + 0.12);
+                    });
+                } else {
+                    var osc = ctx.createOscillator();
+                    var gain = ctx.createGain();
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.frequency.value = 600;
+                    osc.type = 'sine';
+                    gain.gain.value = 0.25;
+                    osc.start(ctx.currentTime);
+                    osc.stop(ctx.currentTime + 0.4);
+                }
+            } catch(e) {}
+        }
+        function formatDuration(seconds) {
+            if (!seconds || seconds <= 0) return "-";
+            var d = Math.floor(seconds / 86400);
+            var h = Math.floor((seconds % 86400) / 3600);
+            var m = Math.floor((seconds % 3600) / 60);
+            if (d > 0) return d + "d " + h + "h";
+            if (h > 0) return h + "h " + m + "m";
+            return m + "m";
+        }
+        function formatNumber(n, decimals=2) {
+            if (n === null || n === undefined) return '--';
+            return Number(n).toFixed(decimals);
+        }
+        function formatEur(n) {
+            if (n === null || n === undefined) return '--';
+            let prefix = n >= 0 ? '+' : '';
+            return prefix + Number(n).toFixed(2) + ' EUR';
+        }
+        function formatUptime(seconds) {
+            let h = Math.floor(seconds / 3600);
+            let m = Math.floor((seconds % 3600) / 60);
+            return h + 'h ' + m + 'm';
+        }
+
+        function toggleAll(el) {
+            document.querySelectorAll('.selTrade').forEach(cb => { cb.checked = el.checked; });
+            updateSelection();
+        }
+
+        function updateSelection() {
+            var checks = document.querySelectorAll('.selTrade:checked');
+            var bar = document.getElementById('selectionBar');
+            if (checks.length === 0) {
+                bar.style.display = 'none';
+                return;
+            }
+            bar.style.display = 'flex';
+            var totalPnl = 0, totalBook = 0;
+            checks.forEach(cb => {
+                totalPnl += parseFloat(cb.dataset.pnl);
+                totalBook += parseFloat(cb.dataset.book);
+            });
+            var pc = totalPnl >= 0 ? '#3fb950' : '#f85149';
+            var bc = totalBook >= 0 ? '#3fb950' : '#f85149';
+            var ps = totalPnl >= 0 ? '+' : '';
+            var bs = totalBook >= 0 ? '+' : '';
+            var pnlEurStr = lastEurRate > 0 ? ' <span style="color:' + pc + ';">(' + ps + formatNumber(totalPnl / lastEurRate, 2) + ' EUR)</span>' : '';
+            var bookEurStr = lastEurRate > 0 ? ' <span style="color:' + bc + ';">(' + bs + formatNumber(totalBook / lastEurRate, 2) + ' EUR)</span>' : '';
+            document.getElementById('selSummary').innerHTML =
+                '<strong>' + checks.length + ' selected</strong> | ' +
+                'PnL: <span style="color:' + pc + ';font-weight:700;">' + ps + formatNumber(totalPnl, 2) + ' USDT</span>' + pnlEurStr + ' | ' +
+                'BOOK: <span style="color:' + bc + ';font-weight:700;">' + bs + formatNumber(totalBook, 2) + ' USDT</span>' + bookEurStr;
+        }
+
+        async function closeSelected() {
+            var checks = document.querySelectorAll('.selTrade:checked');
+            if (checks.length === 0) return;
+            var ids = [];
+            checks.forEach(cb => ids.push(parseInt(cb.dataset.id)));
+            if (!confirm('Close ' + ids.length + ' selected positions?')) return;
+            try {
+                let r = await fetch('/api/close-selected', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ids: ids})});
+                let d = await r.json();
+                if (d.success) {
+                    refresh();
+                } else {
+                    alert('Error: ' + (d.error || 'unknown'));
+                }
+            } catch(e) { alert('Error: ' + e.message); }
+        }
+
+
+        async function saveIndTpsl(tradeId) {
+            var tp = parseFloat(document.getElementById('itp_' + tradeId).value) || 0;
+            var sl = parseFloat(document.getElementById('isl_' + tradeId).value) || 0;
+            var cb = document.getElementById('ia_' + tradeId);
+            var active = cb.checked ? 1 : 0;
+            await fetch('/api/trade-tpsl/' + tradeId, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({tp_pct: tp, sl_pct: sl, active: active})
+            });
+        }
+        async function toggleIndActive(tradeId) {
+            var cb = document.getElementById('ia_' + tradeId);
+            var tp = parseFloat(document.getElementById('itp_' + tradeId).value) || 0;
+            var sl = parseFloat(document.getElementById('isl_' + tradeId).value) || 0;
+            var label = cb.parentElement.querySelector('.ind-label');
+            if (cb.checked) {
+                if (!label) {
+                    var s = document.createElement('span');
+                    s.className = 'ind-label';
+                    s.style.cssText = 'color:#f0883e;font-size:10px;font-weight:700;margin-right:4px;';
+                    s.textContent = 'Activated';
+                    cb.after(s);
+                }
+            } else {
+                if (label) label.remove();
+            }
+            fetch('/api/trade-tpsl/' + tradeId, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({tp_pct: tp, sl_pct: sl, active: cb.checked ? 1 : 0})
+            });
+        }
+        async function closePosition(tradeId) {
+            if (!confirm('Close this position at current market price?')) return;
+            try {
+                let r = await fetch('/api/close-position/' + tradeId, {method: 'POST'});
+                let d = await r.json();
+                if (d.success) {
+                    refresh();
+                } else {
+                    alert('Error: ' + (d.error || 'unknown'));
+                }
+            } catch(e) { alert('Error: ' + e.message); }
+        }
+
+        async function removePosition(tradeId) {
+            if (!confirm('Remove this position from tracker? (Does NOT sell on Binance)')) return;
+            try {
+                let r = await fetch('/api/remove-position/' + tradeId, {method: 'POST'});
+                let d = await r.json();
+                if (d.success) { refresh(); }
+                else { alert('Error: ' + (d.error || 'unknown')); }
+            } catch(e) { alert('Error: ' + e.message); }
+        }
+
+        async function closeAllPositions() {
+            if (!confirm('Close ALL open positions at current market price?')) return;
+            try {
+                let r = await fetch('/api/close-all', {method: 'POST'});
+                let d = await r.json();
+                if (d.success) {
+                    alert('Closed ' + d.closed + ' positions');
+                    refresh();
+                } else {
+                    alert('Error: ' + (d.error || 'unknown'));
+                }
+            } catch(e) { alert('Error: ' + e.message); }
+        }
+
+        var condSelActive = false;
+        var condAllActive = false;
+
+        async function toggleConditionalSel() {
+            if (condSelActive) {
+                try { await fetch('/api/conditional-close/sel', {method: 'DELETE'}); } catch(e) {}
+                condSelActive = false;
+                document.getElementById('btnCondSelActivate').textContent = 'ACTIVATE';
+                document.getElementById('btnCondSelActivate').style.background = '#238636';
+                document.getElementById('condSelStatus').textContent = '';
+                return;
+            }
+            var checks = document.querySelectorAll('.selTrade:checked');
+            if (checks.length === 0) { alert('Select positions first'); return; }
+            var ids = [];
+            checks.forEach(cb => ids.push(parseInt(cb.dataset.id)));
+            var tp = parseFloat(document.getElementById('condSelTp').value) || 0;
+            var tpBook = parseFloat(document.getElementById('condSelTpBook').value) || 0;
+            var sl = parseFloat(document.getElementById('condSelSl').value) || 0;
+            var slBook = parseFloat(document.getElementById('condSelSlBook').value) || 0;
+            if (tp === 0 && tpBook === 0 && sl === 0 && slBook === 0) { alert('Set at least one threshold'); return; }
+            try {
+                let r = await fetch('/api/conditional-close/sel', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ids: ids, tp_usdt: tp > 0 ? tp : null, tp_book: tpBook > 0 ? tpBook : null, sl_usdt: sl > 0 ? sl : null, sl_book: slBook > 0 ? slBook : null})
+                });
+                let d = await r.json();
+                if (d.success) {
+                    condSelActive = true;
+                    document.getElementById('btnCondSelActivate').textContent = 'DEACTIVATE';
+                    document.getElementById('btnCondSelActivate').style.background = '#e74c3c';
+                    var parts = [];
+                    if (tp > 0) parts.push('TP: ' + tp);
+                    if (tpBook > 0) parts.push('TP Book: ' + tpBook);
+                    if (sl > 0) parts.push('SL: -' + sl);
+                    if (slBook > 0) parts.push('SL Book: -' + slBook);
+                    document.getElementById('condSelStatus').innerHTML = '<span style="color:#f0883e;">ACTIVE: ' + d.count + ' pos | ' + parts.join(' | ') + ' USDT</span>';
+                }
+            } catch(e) { alert('Error: ' + e.message); }
+        }
+
+        async function toggleConditionalAll() {
+            if (condAllActive) {
+                try { await fetch('/api/conditional-close/all', {method: 'DELETE'}); } catch(e) {}
+                condAllActive = false;
+                document.getElementById('btnCondAllActivate').textContent = 'ACTIVATE';
+                document.getElementById('btnCondAllActivate').style.background = '#238636';
+                document.getElementById('condAllStatus').textContent = '';
+                return;
+            }
+            var tp = parseFloat(document.getElementById('condAllTp').value) || 0;
+            var tpBook = parseFloat(document.getElementById('condAllTpBook').value) || 0;
+            var sl = parseFloat(document.getElementById('condAllSl').value) || 0;
+            var slBook = parseFloat(document.getElementById('condAllSlBook').value) || 0;
+            if (tp === 0 && tpBook === 0 && sl === 0 && slBook === 0) { alert('Set at least one threshold'); return; }
+            try {
+                let r = await fetch('/api/conditional-close/all', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({tp_usdt: tp > 0 ? tp : null, tp_book: tpBook > 0 ? tpBook : null, sl_usdt: sl > 0 ? sl : null, sl_book: slBook > 0 ? slBook : null})
+                });
+                let d = await r.json();
+                if (d.success) {
+                    condAllActive = true;
+                    document.getElementById('btnCondAllActivate').textContent = 'DEACTIVATE';
+                    document.getElementById('btnCondAllActivate').style.background = '#e74c3c';
+                    var parts = [];
+                    if (tp > 0) parts.push('TP: ' + tp);
+                    if (tpBook > 0) parts.push('TP Book: ' + tpBook);
+                    if (sl > 0) parts.push('SL: -' + sl);
+                    if (slBook > 0) parts.push('SL Book: -' + slBook);
+                    document.getElementById('condAllStatus').innerHTML = '<span style="color:#f0883e;">ACTIVE: ALL pos | ' + parts.join(' | ') + ' USDT</span>';
+                }
+            } catch(e) { alert('Error: ' + e.message); }
+        }
+
+        function checkConditionalStatus(data) {
+            if (!data.conditional_triggered) return;
+            data.conditional_triggered.forEach(function(t) {
+                if (t.mode === 'sel') {
+                    condSelActive = false;
+                    document.getElementById('btnCondSelActivate').textContent = 'ACTIVATE';
+                    document.getElementById('btnCondSelActivate').style.background = '#238636';
+                    document.getElementById('condSelStatus').innerHTML = '<span style="color:#3fb950;">TRIGGERED: Closed ' + t.closed + ' pos (' + t.reason + ': ' + t.value.toFixed(2) + ' USDT)</span>';
+                } else {
+                    condAllActive = false;
+                    document.getElementById('btnCondAllActivate').textContent = 'ACTIVATE';
+                    document.getElementById('btnCondAllActivate').style.background = '#238636';
+                    document.getElementById('condAllStatus').innerHTML = '<span style="color:#3fb950;">TRIGGERED: Closed ' + t.closed + ' pos (' + t.reason + ': ' + t.value.toFixed(2) + ' USDT)</span>';
+                }
+            });
+            refresh();
+        }
+
+        function toggleJournal() {
+                let body = document.getElementById('journalBody');
+                body.style.display = body.style.display === 'none' ? 'block' : 'none';
+            }
+            async function loadJournal() {
+                let results = document.getElementById('journalResults');
+                results.innerHTML = 'Loading...';
+                try {
+                    let resp = await fetch('/api/journal');
+                    let data = await resp.json();
+                    let dates = Object.keys(data).sort().reverse();
+                    if (dates.length === 0) {
+                        results.innerHTML = '<p style="color:#8b949e;">No journal data yet. Stats will appear after the system detects crashes.</p>';
+                        return;
+                    }
+                    let html = '<table style="width:100%;font-size:13px;">';
+                    html += '<tr style="border-bottom:2px solid #30363d;">';
+                    html += '<th rowspan="2" style="padding:8px;vertical-align:middle;">Date</th>';
+                    html += '<th colspan="4" style="padding:6px;text-align:center;color:#3fb950;border-bottom:1px solid #238636;">EUR (Convert)</th>';
+                    html += '<th colspan="4" style="padding:6px;text-align:center;color:#58a6ff;border-bottom:1px solid #1f6feb;">USDC (Spot)</th>';
+                    html += '</tr><tr style="border-bottom:1px solid #30363d;">';
+                    html += '<th style="padding:4px 6px;color:#3fb950;font-size:11px;">Max Simul</th>';
+                    html += '<th style="padding:4px 6px;color:#f0883e;font-size:11px;">Skip Limit</th>';
+                    html += '<th style="padding:4px 6px;color:#f85149;font-size:11px;">Skip Funds</th>';
+                    html += '<th style="padding:4px 6px;color:#da3633;font-size:11px;">Skip Error</th>';
+                    html += '<th style="padding:4px 6px;color:#58a6ff;font-size:11px;">Max Simul</th>';
+                    html += '<th style="padding:4px 6px;color:#f0883e;font-size:11px;">Skip Limit</th>';
+                    html += '<th style="padding:4px 6px;color:#f85149;font-size:11px;">Skip Funds</th>';
+                    html += '<th style="padding:4px 6px;color:#da3633;font-size:11px;">Skip Error</th>';
+                    html += '</tr>';
+                    dates.forEach(function(d) {
+                        let j = data[d];
+                        html += '<tr style="border-bottom:1px solid #21262d;">';
+                        html += '<td style="padding:6px;color:#c9d1d9;font-weight:600;">' + d + '</td>';
+                        html += '<td style="padding:6px;text-align:center;color:#3fb950;">' + (j.eur_max_simul||0) + '</td>';
+                        html += '<td style="padding:6px;text-align:center;color:' + ((j.eur_skip_limit||0) > 0 ? '#f0883e' : '#484f58') + ';">' + (j.eur_skip_limit||0) + '</td>';
+                        html += '<td style="padding:6px;text-align:center;color:' + ((j.eur_skip_funds||0) > 0 ? '#f85149' : '#484f58') + ';">' + (j.eur_skip_funds||0) + '</td>';
+                        html += '<td style="padding:6px;text-align:center;color:' + ((j.eur_skip_error||0) > 0 ? '#da3633' : '#484f58') + ';">' + (j.eur_skip_error||0) + '</td>';
+                        html += '<td style="padding:6px;text-align:center;color:#58a6ff;">' + (j.usdc_max_simul||0) + '</td>';
+                        html += '<td style="padding:6px;text-align:center;color:' + ((j.usdc_skip_limit||0) > 0 ? '#f0883e' : '#484f58') + ';">' + (j.usdc_skip_limit||0) + '</td>';
+                        html += '<td style="padding:6px;text-align:center;color:' + ((j.usdc_skip_funds||0) > 0 ? '#f85149' : '#484f58') + ';">' + (j.usdc_skip_funds||0) + '</td>';
+                        html += '<td style="padding:6px;text-align:center;color:' + ((j.usdc_skip_error||0) > 0 ? '#da3633' : '#484f58') + ';">' + (j.usdc_skip_error||0) + '</td>';
+                        html += '</tr>';
+                    });
+                    html += '</table>';
+                    results.innerHTML = html;
+                } catch(e) {
+                    results.innerHTML = 'Error loading journal: ' + e.message;
+                }
+            }
+            async function resetSkipped() {
+                if (!confirm('Reset skipped counters?')) return;
+                let r = await fetch('/api/reset-skipped', {method:'POST'});
+                let d = await r.json();
+                if (d.success) document.getElementById('statSkipped').innerHTML = '';
+            }
+            async function resetHistory() {
+            if (!confirm('Reset Realized P&L to zero? (Open positions will NOT be affected)')) return;
+            try {
+                let r = await fetch('api/reset-history', {method:'POST'});
+                let d = await r.json();
+                if (d.success) { alert('Realized P&L reset. Cleared ' + d.deleted + ' closed trades.'); refresh(); }
+                else { alert('Error: ' + (d.error || 'unknown')); }
+            } catch(e) { alert('Error: ' + e); }
+        }
+
+        async function refresh() {
+            try {
+                let resp = await fetch('api/data?t=' + Date.now());
+                let data = await resp.json();
+
+                // Update status
+                let dot = document.getElementById('statusDot');
+                let txt = document.getElementById('statusText');
+                if (data.stats.ws_connected) {
+                    dot.className = 'status-dot';
+                    txt.textContent = data.stats.symbols_monitored + ' pairs live';
+                } else {
+                    dot.className = 'status-dot offline';
+                    txt.textContent = 'Disconnected';
+                }
+                var badge = document.getElementById('tradingBadge');
+                var modeText = document.getElementById('tradingModeText');
+                var uptimeEl = document.getElementById('tradingUptime');
+                if (data.stats.trading_mode === 'live') {
+                    badge.style.borderColor = '#f0883e';
+                    badge.style.color = '#f0883e';
+                    badge.querySelector('span').style.background = '#f0883e';
+                    modeText.textContent = 'LIVE Trading Active';
+                } else {
+                    badge.style.borderColor = '#238636';
+                    badge.style.color = '#3fb950';
+                    badge.querySelector('span').style.background = '#3fb950';
+                    modeText.textContent = 'Paper Trading Active';
+                }
+                if (data.stats.uptime) {
+                    var s = Math.floor(data.stats.uptime);
+                    var d = Math.floor(s / 86400); s %= 86400;
+                    var h = Math.floor(s / 3600); s %= 3600;
+                    var m = Math.floor(s / 60); s %= 60;
+                    var parts = [];
+                    if (d > 0) parts.push(d + 'd');
+                    parts.push(h + 'h');
+                    parts.push(m + 'm');
+                    parts.push(s + 's');
+                    uptimeEl.textContent = parts.join(' ');
+                }
+                if (data.stats.active_config) {
+                    var c = data.stats.active_config;
+                    document.getElementById('activeConfig').textContent =
+                        c.threshold + '% | ' + c.windows.join(',') + 'm | TP:' + c.tp + '% SL:' + c.sl + '% | ' + c.amount + ' USDT | ' + c.coins + ' coins | Max:' + (c.max_trades > 0 ? c.max_trades + ' trades' : 'unlimited');
+                }
+
+                // Stats
+                // Quota alert
+                if (data.quota) {
+                    let qd = document.getElementById('quotaAlert');
+                    if (qd) {
+                        if (data.quota.exhausted) {
+                            qd.style.display = 'block';
+                            qd.style.background = '#b62324';
+                            qd.innerHTML = 'CONVERT QUOTA EXHAUSTED - Buy/sell manually or wait for midnight UTC reset. Calls today: ' + data.quota.calls_today;
+                        } else if (data.quota.limit > 0 && data.quota.pct >= 90) {
+                            qd.style.display = 'block';
+                            qd.style.background = '#b62324';
+                            qd.innerHTML = 'CONVERT QUOTA CRITICAL: ' + data.quota.pct + '% used (' + data.quota.calls_today + '/' + data.quota.limit + ' calls). Almost exhausted!';
+                        } else if (data.quota.limit > 0 && data.quota.pct >= 50) {
+                            qd.style.display = 'block';
+                            qd.style.background = '#d29922';
+                            qd.innerHTML = 'CONVERT QUOTA WARNING: ' + data.quota.pct + '% used (' + data.quota.calls_today + '/' + data.quota.limit + ' calls).';
+                        } else {
+                            qd.style.display = 'none';
+                        }
+                    }
+                }
+                document.getElementById('statPairs').textContent = data.stats.symbols_monitored;
+                document.getElementById('statCrashes').textContent = data.crashes_24h;
+                document.getElementById('statOpen').textContent = data.portfolio.open_count;
+                var skL = (data.stats && data.stats.trades_skipped_limit) || 0;
+                var skF = (data.stats && data.stats.trades_skipped_funds) || 0;
+                var skTotal = skL + skF;
+                document.getElementById('statSkipped').innerHTML = skTotal > 0 ? 'Skipped: ' + skTotal + ' <span onclick="resetSkipped()" style="color:#f85149;cursor:pointer;font-size:10px;border:1px solid #f85149;padding:0px 4px;border-radius:3px;margin-left:4px;">[RESET]</span>' : '';
+                document.getElementById('statInvested').textContent =
+                    formatNumber(data.portfolio.total_invested) + ' EUR';
+
+                let unr = document.getElementById('statUnrealized');
+                unr.textContent = formatEur(data.portfolio.unrealized_pnl);
+                unr.className = 'value ' + (data.portfolio.unrealized_pnl >= 0 ? 'positive' : 'negative');
+
+                let real = document.getElementById('statRealized');
+                real.textContent = formatEur(data.portfolio.realized_pnl);
+                real.className = 'value ' + (data.portfolio.realized_pnl >= 0 ? 'positive' : 'negative');
+
+                document.getElementById('statWinRate').textContent =
+                    formatNumber(data.portfolio.win_rate, 1) + '%';
+                document.getElementById('statUptime').textContent =
+                    formatUptime(data.stats.uptime);
+                if (data.binance_balances) {
+                    document.getElementById('statEurBal').textContent = formatNumber(data.binance_balances.eur, 2) + ' EUR';
+                    document.getElementById('statUsdcBal').textContent = formatNumber(data.binance_balances.usdc, 2) + ' USDC';
+                }
+                if (data.total_portfolio) {
+                    document.getElementById('statPortfolioVal').innerHTML =
+                        formatNumber(data.total_portfolio.usdc, 2) + ' USDT' +
+                        '<br><span style="color:#a371f7;font-size:13px;">≈ ' + formatNumber(data.total_portfolio.eur, 2) + ' EUR</span>';
+                }
+                if (data.pnl_today) {
+                    var ptc = data.pnl_today.usdt >= 0 ? '#3fb950' : '#f85149';
+                    var pts = data.pnl_today.usdt >= 0 ? '+' : '';
+                    document.getElementById('statPnlToday').innerHTML =
+                        '<span style="color:' + ptc + ';font-weight:700;">' + pts + formatNumber(data.pnl_today.usdt, 2) + ' USDT</span>' +
+                        '<br><span style="color:' + ptc + ';font-size:13px;">' + pts + formatNumber(data.pnl_today.eur, 2) + ' EUR (' + pts + data.pnl_today.pct + '%)</span>';
+                }
+
+                // Portfolio summary bar
+                if (data.portfolio_ext) {
+                    var pe = data.portfolio_ext;
+                    var er = pe.eur_rate || 0;
+                    lastEurRate = er;
+                    function eurLine(usdt, color) {
+                        if (er <= 0) return '';
+                        var c = color || '#f0883e';
+                        return '<br><span style="color:' + c + ';">(' + formatNumber(usdt / er, 2) + ' EUR)</span>';
+                    }
+                    document.getElementById('sumOpen').textContent = pe.open_count;
+                    document.getElementById('sumInvested').innerHTML =
+                        formatNumber(pe.total_invested, 2) + ' USDT' + eurLine(pe.total_invested, '#c9d1d9');
+                    var vc = pe.current_value >= pe.total_invested ? '#3fb950' : '#f85149';
+                    var valEurLine2 = er > 0 ? '<br><span style="color:' + vc + ';">(' + formatNumber(pe.current_value / er, 2) + ' EUR)</span>' : '';
+                    document.getElementById('sumValue').innerHTML =
+                        '<span style="color:' + vc + ';font-weight:700;">' + formatNumber(pe.current_value, 2) + ' USDT</span>' + valEurLine2;
+                    var pc = pe.total_pnl >= 0 ? '#3fb950' : '#f85149';
+                    var ps = pe.total_pnl >= 0 ? '+' : '';
+                    var pnlEurHtml = er > 0 ? '<br><span style="color:' + pc + ';">(' + ps + formatNumber(pe.total_pnl / er, 2) + ' EUR)</span>' : '';
+                    document.getElementById('sumPnl').innerHTML =
+                        '<span style="color:' + pc + ';font-weight:700;">' + ps + formatNumber(pe.total_pnl, 2) + ' USDT</span>' + pnlEurHtml;
+                    var bc = pe.pnl_book >= 0 ? '#3fb950' : '#f85149';
+                    var bs = pe.pnl_book >= 0 ? '+' : '';
+                    var bookEurHtml = er > 0 ? '<br><span style="color:' + bc + ';">(' + bs + formatNumber(pe.pnl_book / er, 2) + ' EUR)</span>' : '';
+                    document.getElementById('sumPnlBook').innerHTML =
+                        '<span style="color:' + bc + ';font-weight:700;">' + bs + formatNumber(pe.pnl_book, 2) + ' USDT</span>' + bookEurHtml;
+                }
+
+                // Update EUR conversion next to conditional inputs
+                if (data.portfolio_ext && data.portfolio_ext.eur_rate > 0) {
+                    var er = data.portfolio_ext.eur_rate;
+                    function showEur(inputId, spanId) {
+                        var v = parseFloat(document.getElementById(inputId).value) || 0;
+                        document.getElementById(spanId).textContent = v > 0 ? '(' + (v / er).toFixed(2) + ' EUR)' : '';
+                    }
+                    showEur('condAllTp', 'condAllTpEur');
+                    showEur('condAllTpBook', 'condAllTpBookEur');
+                    showEur('condAllSl', 'condAllSlEur');
+                    showEur('condAllSlBook', 'condAllSlBookEur');
+                    showEur('condSelTp', 'condSelTpEur');
+                    showEur('condSelTpBook', 'condSelTpBookEur');
+                    showEur('condSelSl', 'condSelSlEur');
+                    showEur('condSelSlBook', 'condSelSlBookEur');
+                }
+
+                // Check conditional close triggers
+                checkConditionalStatus(data);
+
+                // Top drops table
+                if (data.top_drops && data.top_drops.length > 0) {
+                    let tdDiv = document.getElementById('topDropsTable');
+                    document.getElementById('topDropsCount').textContent = data.top_drops.length;
+                    let html = '<table><tr><th>#</th><th>Pair</th><th>Drop</th><th>High</th><th>Current</th><th>Window</th></tr>';
+                    data.top_drops.forEach((d, i) => {
+                        let dropClass = d.drop >= 10 ? 'pnl-negative' : '';
+                        html += `<tr>
+                            <td>${i+1}</td>
+                            <td><strong>${d.symbol}</strong></td>
+                            <td class="${dropClass}">-${formatNumber(d.drop, 2)}%</td>
+                            <td>${formatNumber(d.high, 8)}</td>
+                            <td>${formatNumber(d.current, 8)}</td>
+                            <td>${d.window}m</td>
+                        </tr>`;
+                    });
+                    html += '</table>';
+                    tdDiv.innerHTML = html;
+                }
+
+                // Crashes table
+                let crashDiv = document.getElementById('crashTable');
+                document.getElementById('crashCount').textContent = data.crashes.length;
+                if (data.crashes.length > 0) {
+                    let html = '<table><tr><th>Time</th><th>Pair</th><th>Drop</th><th>From</th><th>To</th><th>Window</th></tr>';
+                    data.crashes.forEach(c => {
+                        let cls = c.acknowledged ? '' : 'class="alert-row"';
+                        html += `<tr ${cls}>
+                            <td>${c.detected_at_str}</td>
+                            <td><strong>${c.symbol}</strong></td>
+                            <td class="pnl-negative">-${formatNumber(c.drop_percent, 1)}%</td>
+                            <td>${formatNumber(c.price_start, 8)}</td>
+                            <td>${formatNumber(c.price_end, 8)}</td>
+                            <td>${c.time_window_min}m</td>
+                        </tr>`;
+                    });
+                    html += '</table>';
+                    crashDiv.innerHTML = html;
+                } else {
+                    crashDiv.innerHTML = '<div class="empty-state">No crashes detected yet. Monitoring...</div>';
+                }
+
+                // Open trades
+                let openDiv = document.getElementById('openTradesTable');
+                document.getElementById('openCount').textContent = data.open_trades.length;
+                if (prevTradeCount >= 0 && data.open_trades.length > prevTradeCount) {
+                    playAlert('buy');
+                }
+                if (data.open_trades.length > 0) {
+                    var checkedIds = {};
+                    document.querySelectorAll('.selTrade:checked').forEach(cb => { checkedIds[cb.dataset.id] = true; });
+                    var allChecked = document.getElementById('selectAll') && document.getElementById('selectAll').checked;
+                    var er2 = (data.portfolio_ext && data.portfolio_ext.eur_rate > 0) ? data.portfolio_ext.eur_rate : 0;
+                    let html = '<table><tr><th><input type="checkbox" id="selectAll" onchange="toggleAll(this)"></th><th>Coin</th><th>Via</th><th>Duration</th><th>Qty</th><th>Entry</th><th>Current</th><th>Invested</th><th>Value</th><th>PnL</th><th></th></tr>';
+                    data.open_trades.forEach(t => {
+                        var coin = t.symbol.replace('USDT','');
+                        var invested = t.quantity * t.entry_price;
+                        var value = t.quantity * (t.current_price || t.entry_price);
+                        var pnlUsdt = value - invested;
+                        var pnlPct = t.pnl_percent;
+                        var bookPrice = t.book_price || t.current_price || t.entry_price;
+                        var bookValue = t.quantity * bookPrice;
+                        var bookPnl = bookValue - invested;
+                        var bookPct = ((bookPrice - t.entry_price) / t.entry_price) * 100;
+                        var pc = pnlPct >= 0 ? '#3fb950' : '#f85149';
+                        var bc = bookPct >= 0 ? '#3fb950' : '#f85149';
+                        var ps = pnlPct >= 0 ? '+' : '';
+                        var bs = bookPct >= 0 ? '+' : '';
+                        var invEur = er2 > 0 ? '<br><span style="color:#8b949e;">' + formatNumber(invested/er2, 2) + ' EUR</span>' : '';
+                        var valEur = er2 > 0 ? '<br><span style="color:' + pc + ';">' + formatNumber(value/er2, 2) + ' EUR</span>' : '';
+                        var pnlEurVal = er2 > 0 ? pnlUsdt / er2 : 0;
+                        var bookEurVal = er2 > 0 ? bookPnl / er2 : 0;
+                        var pnlHtml = '<span style="color:' + pc + ';font-weight:700;">' + ps + formatNumber(pnlPct, 2) + '% (' + ps + formatNumber(pnlUsdt, 2) + ' USDT)</span>';
+                        if (er2 > 0) pnlHtml += '<br><span style="color:' + pc + ';">' + ps + formatNumber(pnlEurVal, 2) + ' EUR</span>';
+                        pnlHtml += '<br><span style="color:' + bc + ';">BOOK: ' + bs + formatNumber(bookPct, 2) + '% (' + bs + formatNumber(bookPnl, 2) + ' USDT)</span>';
+                        if (er2 > 0) pnlHtml += '<br><span style="color:' + bc + ';font-size:15px;font-weight:700;">' + bs + formatNumber(bookEurVal, 2) + ' EUR</span>';
+                        if (t.fill_avg) pnlHtml += '<br><small style="color:#8b949e;">Fill: ' + formatNumber(t.fill_avg, 8) + ' | Slip: ' + formatNumber(t.slip_pct, 3) + '% | ' + (t.book_levels||0) + ' lvl</small>';
+                        html += '<tr>' +
+                            '<td><input type="checkbox" class="selTrade" data-id="' + t.id + '" data-pnl="' + pnlUsdt.toFixed(2) + '" data-book="' + bookPnl.toFixed(2) + '" onchange="updateSelection()"></td>' +
+                            '<td><strong>' + coin + '</strong></td>' +
+                            '<td style="text-align:center;"><span style="padding:2px 6px;border-radius:3px;font-size:11px;font-weight:700;' + (t.trade_method === 'SPOT_USDC' ? 'background:#1f3a5f;color:#58a6ff;' : 'background:#1a3a1a;color:#3fb950;') + '">' + (t.trade_method === 'SPOT_USDC' ? 'P' : 'C') + '</span></td>' +
+                            '<td style="text-align:center;font-size:12px;color:#8b949e;">' + formatDuration((Date.now()/1000) - t.entry_time) + '</td>' +
+                            '<td>' + formatNumber(t.quantity, 4) + '</td>' +
+                            '<td>' + formatNumber(t.entry_price, 8) + '</td>' +
+                            '<td>' + formatNumber(t.current_price, 8) + '</td>' +
+                            '<td>' + formatNumber(invested, 2) + invEur + '</td>' +
+                            '<td><span style="color:' + pc + ';font-weight:700;">' + formatNumber(value, 2) + '</span>' + valEur + '</td>' +
+                            '<td>' + pnlHtml + '</td>' +
+                            '<td style="white-space:nowrap;">' +
+                            '<input type="checkbox" id="ia_' + t.id + '" ' + (t.ind_active ? 'checked' : '') + ' onchange="toggleIndActive(' + t.id + ')" title="Enable individual TP/SL" style="margin-right:4px;cursor:pointer;"> ' +
+                            (t.ind_active ? '<span class="ind-label" style="color:#f0883e;font-size:10px;font-weight:700;margin-right:4px;">Activated</span>' : '') +
+                            '<span style="color:#3fb950;font-size:10px;font-weight:600;">TP</span> ' +
+                            '<input type="text" id="itp_' + t.id + '" value="' + (t.ind_tp_pct || '') + '" placeholder="USDT" style="width:50px;padding:2px 4px;background:#0d1117;border:1px solid #238636;border-radius:3px;color:#3fb950;font-size:11px;text-align:center;" onchange="saveIndTpsl(' + t.id + ')"> ' +
+                            '<span style="color:#f85149;font-size:10px;font-weight:600;">SL</span> ' +
+                            '<input type="text" id="isl_' + t.id + '" value="' + (t.ind_sl_pct || '') + '" placeholder="USDT" style="width:50px;padding:2px 4px;background:#0d1117;border:1px solid #da3633;border-radius:3px;color:#f85149;font-size:11px;text-align:center;" onchange="saveIndTpsl(' + t.id + ')"> ' +
+                            '<button onclick="closePosition(' + t.id + ')" style="background:#e74c3c;color:#fff;border:none;padding:4px 10px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;">Close</button> ' +
+                            '<button onclick="removePosition(' + t.id + ')" style="background:#555;color:#fff;border:none;padding:4px 6px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;" title="Remove from tracker only">X</button> ' +
+                            '<a href="https://www.binance.com/en/trade/' + coin + '_USDT" target="_blank" style="background:#1e6dc7;color:#fff;border:none;padding:4px 6px;font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;text-decoration:none;display:inline-block;" title="Open on Binance">B</a>' +
+                            '</td>' +
+                            '</tr>';
+                    });
+                    html += '</table>';
+                    openDiv.innerHTML = html;
+                    if (allChecked) {
+                        var sa = document.getElementById('selectAll');
+                        if (sa) sa.checked = true;
+                        document.querySelectorAll('.selTrade').forEach(cb => { cb.checked = true; });
+                    } else {
+                        document.querySelectorAll('.selTrade').forEach(cb => {
+                            if (checkedIds[cb.dataset.id]) cb.checked = true;
+                        });
+                    }
+                    updateSelection();
+                } else {
+                    openDiv.innerHTML = '<div class="empty-state">No open positions</div>';
+                }
+
+                // Closed trades
+                let closedDiv = document.getElementById('closedTradesTable');
+                document.getElementById('closedCount').textContent = data.closed_trades.length;
+                if (prevClosedCount >= 0 && data.closed_trades.length > prevClosedCount) {
+                    playAlert('sell');
+                }
+                if (data.closed_trades.length > 0) {
+                    let html = '<table><tr><th>Entry Time</th><th>Exit Time</th><th>Pair</th><th>Duration</th><th>Entry</th><th>Exit</th><th>Amount</th><th>P&L</th><th>Status</th><th></th></tr>';
+                    data.closed_trades.forEach(t => {
+                        let pnlClass = t.pnl_percent >= 0 ? 'pnl-positive' : 'pnl-negative';
+                        html += `<tr>
+                            <td>${t.entry_time_str}</td>
+                            <td>${t.exit_time_str || "-"}</td>
+                            <td><strong>${t.symbol}</strong></td>
+                            <td style="text-align:center;font-size:12px;color:#8b949e;">${t.exit_time && t.entry_time ? formatDuration(t.exit_time - t.entry_time) : "-"}</td>
+                            <td>${formatNumber(t.entry_price, 8)}</td>
+                            <td>${formatNumber(t.exit_price, 8)}</td>
+                            <td>${formatNumber(t.amount_eur)} EUR</td>
+                            <td class="${pnlClass}">${formatNumber(t.pnl_percent, 2)}% (${formatEur(t.pnl_eur)})</td>
+                            <td><span class="badge-closed">CLOSED</span></td>
+                            <td style="text-align:center;font-weight:700;font-size:13px;color:${t.close_method==='M'?'#f0883e':'#3fb950'}">${t.close_method || '-'}</td>
+                        </tr>`;
+                    });
+                    html += '</table>';
+                    closedDiv.innerHTML = html;
+                } else {
+                    closedDiv.innerHTML = '<div class="empty-state">No completed trades</div>';
+                }
+
+                prevTradeCount = data.open_trades.length;
+                prevClosedCount = data.closed_trades.length;
+
+            } catch (e) {
+                document.getElementById('statusDot').className = 'status-dot offline';
+                document.getElementById('statusText').textContent = 'Dashboard error';
+            }
+        }
+
+        // Set default dates for historical scanner + backtest
+        (function() {
+            let today = new Date();
+            let weekAgo = new Date(today);
+            weekAgo.setDate(weekAgo.getDate() - 7);
+            let monthAgo = new Date(today);
+            monthAgo.setDate(monthAgo.getDate() - 30);
+            document.getElementById('histTo').value = today.toISOString().split('T')[0];
+            document.getElementById('histFrom').value = weekAgo.toISOString().split('T')[0];
+            document.getElementById('btTo').value = today.toISOString().split('T')[0];
+            document.getElementById('btFrom').value = monthAgo.toISOString().split('T')[0];
+        })();
+
+        function toggleHistory() {
+            let body = document.getElementById('historyBody');
+            body.style.display = body.style.display === 'none' ? 'block' : 'none';
+        }
+
+        async function scanHistory() {
+            let btn = document.getElementById('btnScan');
+            let msg = document.getElementById('histMsg');
+            let results = document.getElementById('histResults');
+            btn.disabled = true;
+            msg.textContent = 'Scanning... this may take 1-2 minutes for many coins...';
+            msg.className = 'settings-msg';
+            results.innerHTML = '';
+
+            let payload = {
+                date_from: document.getElementById('histFrom').value,
+                date_to: document.getElementById('histTo').value,
+                threshold: parseFloat(document.getElementById('histThreshold').value),
+                window_minutes: parseInt(document.getElementById('histWindow').value),
+                top_n: parseInt(document.getElementById('histCount').value)
+            };
+
+            try {
+                let resp = await fetch('api/history/scan', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                let data = await resp.json();
+                if (data.error) {
+                    msg.textContent = 'Error: ' + data.error;
+                    msg.className = 'settings-msg error';
+                } else {
+                    msg.textContent = `Found ${data.results.length} crashes in ${data.coins_scanned} coins (${data.scan_time_seconds}s)`;
+                    if (data.results.length > 0) {
+                        let html = '<table><tr><th>#</th><th>Pair</th><th>Date</th><th>Drop</th><th>High</th><th>Low</th><th>S</th><th>10C</th></tr>';
+                        data.results.forEach((r, i) => {
+                            let sStr = r.recovery_same > 0.5 ? `+${formatNumber(r.recovery_same, 1)}%` : 'No';
+                            let sClass = r.recovery_same > 0.5 ? 'pnl-positive' : '';
+                            let cStr = r.recovery_10c > 0.5 ? `+${formatNumber(r.recovery_10c, 1)}%` : 'No';
+                            let cClass = r.recovery_10c > 0.5 ? 'pnl-positive' : '';
+                            html += `<tr>
+                                <td>${i+1}</td>
+                                <td><strong>${r.symbol}</strong></td>
+                                <td>${r.date}</td>
+                                <td class="pnl-negative">-${formatNumber(r.drop_percent, 1)}%</td>
+                                <td>${formatNumber(r.high_price, 8)}</td>
+                                <td>${formatNumber(r.low_price, 8)}</td>
+                                <td class="${sClass}">${sStr}</td>
+                                <td class="${cClass}">${cStr}</td>
+                            </tr>`;
+                        });
+                        html += '</table>';
+                        results.innerHTML = html;
+                    }
+                }
+            } catch(e) {
+                msg.textContent = 'Scan failed: ' + e.message;
+                msg.className = 'settings-msg error';
+            }
+            btn.disabled = false;
+        }
+
+        function toggleBacktest() {
+            let body = document.getElementById('backtestBody');
+            body.style.display = body.style.display === 'none' ? 'block' : 'none';
+        }
+
+        async function loadPresets() {
+            try {
+                let resp = await fetch('api/presets?t=' + Date.now());
+                let presets = await resp.json();
+                let sel = document.getElementById('btPreset');
+                sel.innerHTML = '<option value="">-- Presets --</option>';
+                Object.keys(presets).forEach(name => {
+                    sel.innerHTML += '<option value="' + name + '">' + name + '</option>';
+                });
+            } catch(e) {}
+        }
+        async function savePreset() {
+            let name = document.getElementById('btPreset').value;
+            if (!name) name = prompt('Preset name (e.g. Setting 1):');
+            if (!name) return;
+            let preset = {
+                threshold: parseFloat(document.getElementById('btThreshold').value),
+                window_minutes: parseInt(document.getElementById('btWindow').value),
+                take_profit: parseFloat(document.getElementById('btTP').value),
+                stop_loss: parseFloat(document.getElementById('btSL').value),
+                max_duration_hours: parseFloat(document.getElementById('btMaxDuration').value),
+                amount: parseFloat(document.getElementById('btAmount').value),
+                max_simultaneous: parseInt(document.getElementById('btMaxTrades').value),
+                top_n: parseInt(document.getElementById('btCoins').value),
+                double_bottom: document.getElementById('btDoubleBottom').value,
+                pump_enabled: document.getElementById('btPumpEnabled').value,
+                pump_tp: parseFloat(document.getElementById('btPumpTP').value),
+                pump_sl: parseFloat(document.getElementById('btPumpSL').value),
+                pump_threshold: parseFloat(document.getElementById('btPumpThreshold').value),
+                pump_window_seconds: parseInt(document.getElementById('btPumpWindow').value)
+            };
+            await fetch('api/presets', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:name, preset:preset})});
+            await loadPresets();
+            document.getElementById('btPreset').value = name;
+            alert('Saved: ' + name);
+        }
+        async function loadPreset() {
+            let name = document.getElementById('btPreset').value;
+            if (!name) return;
+            try {
+                let resp = await fetch('api/presets?t=' + Date.now());
+                let presets = await resp.json();
+                let p = presets[name];
+                if (!p) return;
+                document.getElementById('btThreshold').value = p.threshold || 30;
+                document.getElementById('btWindow').value = p.window_minutes || 15;
+                document.getElementById('btTP').value = p.take_profit || 50;
+                document.getElementById('btSL').value = p.stop_loss || 20;
+                document.getElementById('btMaxDuration').value = p.max_duration_hours || 0;
+                document.getElementById('btAmount').value = p.amount || 1000;
+                document.getElementById('btMaxTrades').value = p.max_simultaneous || 10;
+                document.getElementById('btCoins').value = p.top_n || 100;
+                document.getElementById('btDoubleBottom').value = p.double_bottom || 'off';
+                document.getElementById('btPumpEnabled').value = p.pump_enabled || 'off';
+                document.getElementById('btPumpTP').value = p.pump_tp || 30;
+                document.getElementById('btPumpSL').value = p.pump_sl || 10;
+                document.getElementById('btPumpThreshold').value = p.pump_threshold || 5;
+                document.getElementById('btPumpWindow').value = p.pump_window_seconds || 5;
+            } catch(e) {}
+        }
+        async function deletePreset() {
+            let name = document.getElementById('btPreset').value;
+            if (!name) return;
+            if (!confirm('Delete preset: ' + name + '?')) return;
+            await fetch('api/presets', {method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:name})});
+            await loadPresets();
+        }
+        loadPresets();
+
+        var lastHybridData = null;
+        var lastPayload = null;
+
+        window.refineWithTicks = refineWithTicks;
+        async function refineWithTicks() {
+            if (!lastHybridData || !lastPayload) { console.log('refine: no data', lastHybridData, lastPayload); return; }
+            let msg = document.getElementById('btMsg');
+            let summary = document.getElementById('btSummary');
+            let results = document.getElementById('btResults');
+            let refineBtn = document.getElementById('btnRefine');
+            if (refineBtn) refineBtn.disabled = true;
+            msg.textContent = 'Refining with tick-by-tick data... downloading real trades for each crash...';
+            msg.className = 'settings-msg';
+            try {
+                let resp = await fetch('api/backtest/refine', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        trades: lastHybridData.trades,
+                        take_profit: lastPayload.take_profit,
+                        stop_loss: lastPayload.stop_loss,
+                        pump_tp: lastPayload.pump_tp,
+                        pump_sl: lastPayload.pump_sl,
+                        amount: lastPayload.amount,
+                        max_duration_hours: lastPayload.max_duration_hours,
+                        max_simultaneous: lastPayload.max_simultaneous,
+                        window_minutes: lastPayload.window_minutes,
+                        threshold: lastPayload.threshold
+                    })
+                });
+                let data = await resp.json();
+                if (data.error) {
+                    msg.textContent = 'Refine error: ' + data.error;
+                    msg.className = 'settings-msg error';
+                } else {
+                    let s = data.summary;
+                    msg.textContent = 'Tick refinement complete: ' + s.total_trades + ' trades (' + data.scan_time_seconds + 's)';
+                    let pnlClass = s.total_pnl >= 0 ? 'pnl-positive' : 'pnl-negative';
+                    summary.innerHTML = '<div class="stats-grid" style="margin-top:8px">' +
+                        '<div class="stat-card"><div class="label">Total Trades</div><div class="value">' + s.total_trades + '</div></div>' +
+                        '<div class="stat-card"><div class="label">Win Rate</div><div class="value">' + formatNumber(s.win_rate,1) + '%</div></div>' +
+                        '<div class="stat-card"><div class="label">Total P&L</div><div class="value ' + pnlClass + '">' + formatNumber(s.total_pnl,2) + ' USDT</div></div>' +
+                        '<div class="stat-card"><div class="label">Avg Win</div><div class="value pnl-positive">+' + formatNumber(s.avg_win,2) + '%</div></div>' +
+                        '<div class="stat-card"><div class="label">Avg Loss</div><div class="value pnl-negative">' + formatNumber(s.avg_loss,2) + '%</div></div>' +
+                        '<div class="stat-card"><div class="label">' + (s.best_trade >= 0 ? 'Best' : 'Best') + ' Trade</div><div class="value ' + (s.best_trade >= 0 ? 'pnl-positive' : 'pnl-negative') + '">' + (s.best_trade >= 0 ? '+' : '') + formatNumber(s.best_trade,2) + '%</div></div>' +
+                        '<div class="stat-card"><div class="label">Worst Trade</div><div class="value pnl-negative">' + formatNumber(s.worst_trade,2) + '%</div></div>' +
+                        '<div class="stat-card"><div class="label">Wins / Losses</div><div class="value">' + s.wins + ' / ' + s.losses + '</div></div>' +
+                        '<div class="stat-card"><div class="label">Crash / Pump</div><div class="value">' + (s.crash_trades||0) + ' / ' + (s.pump_trades||0) + '</div></div>' +
+                        '<div class="stat-card"><div class="label">Max Simultaneous</div><div class="value">' + (s.max_simultaneous||0) + ' trades</div></div>' +
+                        '<div class="stat-card"><div class="label">Max Capital Needed</div><div class="value">' + formatNumber(s.max_capital_needed||0, 0) + ' USDT</div></div>' +
+                        '<div class="stat-card"><div class="label">Trades Skipped</div><div class="value">' + (s.trades_skipped||0) + '</div></div>' +
+                        '<div class="stat-card"><div class="label">Avg Duration</div><div class="value">' + (s.avg_duration_hours < 24 ? formatNumber(s.avg_duration_hours,1) + 'h' : formatNumber(s.avg_duration_hours/24,1) + 'd') + '</div></div>' +
+                        '</div>';
+                    if (data.trades.length > 0) {
+                        let html = '<table><tr><th>#</th><th>Pair</th><th>Type</th><th>Entry Date</th><th>Exit Date</th><th>Duration</th><th>Entry</th><th>Exit</th><th>P&L %</th><th>P&L USDT</th><th>Exit Reason</th></tr>';
+                        data.trades.forEach((t, i) => {
+                            let cls = t.pnl_pct >= 0 ? 'pnl-positive' : 'pnl-negative';
+                            let typeCls = t.entry_type === 'pump' ? 'color:#3fb950' : 'color:#f85149';
+                            let typeLabel = (t.entry_type || 'crash').toUpperCase();
+                            let dur = '';
+                            if (t.exit_date && t.entry_date) {
+                                let ms = new Date(t.exit_date) - new Date(t.entry_date);
+                                let secs = Math.floor(ms / 1000);
+                                let d = Math.floor(secs / 86400); secs %= 86400;
+                                let h = Math.floor(secs / 3600); secs %= 3600;
+                                let m = Math.floor(secs / 60); let s2 = secs % 60;
+                                if (d > 0) dur = d + 'd ' + h + 'h ' + m + 'm';
+                                else if (h > 0) dur = h + 'h ' + m + 'm ' + s2 + 's';
+                                else if (m > 0) dur = m + 'm ' + s2 + 's';
+                                else dur = s2 + 's';
+                            }
+                            html += '<tr><td>' + (i+1) + '</td><td><strong>' + t.symbol + '</strong></td><td style="' + typeCls + '">' + typeLabel + '</td><td>' + t.entry_date + '</td><td>' + (t.exit_date||'-') + '</td><td>' + dur + '</td><td>' + formatNumber(t.entry_price,8) + '</td><td>' + formatNumber(t.exit_price,8) + '</td><td class="' + cls + '">' + (t.pnl_pct>=0?'+':'') + formatNumber(t.pnl_pct,2) + '%</td><td class="' + cls + '">' + (t.pnl_usdt>=0?'+':'') + formatNumber(t.pnl_usdt,2) + '</td><td>' + t.exit_reason + '</td></tr>';
+                        });
+                        html += '</table>';
+                        results.innerHTML = html;
+                    }
+                }
+            } catch(e) {
+                msg.textContent = 'Refine failed: ' + e.message;
+                msg.className = 'settings-msg error';
+            }
+            if (refineBtn) refineBtn.disabled = false;
+        }
+
+        async function runBacktest() {
+            let btn = document.getElementById('btnBacktest');
+            let msg = document.getElementById('btMsg');
+            let summary = document.getElementById('btSummary');
+            let results = document.getElementById('btResults');
+            btn.disabled = true;
+            lastHybridData = null;
+            msg.textContent = 'Running backtest... this may take several minutes for long periods...';
+            msg.className = 'settings-msg';
+            summary.innerHTML = '';
+            results.innerHTML = '';
+
+            lastPayload = {
+                date_from: document.getElementById('btFrom').value,
+                date_to: document.getElementById('btTo').value,
+                threshold: parseFloat(document.getElementById('btThreshold').value),
+                window_minutes: parseInt(document.getElementById('btWindow').value),
+                take_profit: parseFloat(document.getElementById('btTP').value),
+                stop_loss: parseFloat(document.getElementById('btSL').value),
+                max_duration_hours: parseFloat(document.getElementById('btMaxDuration').value),
+                amount: parseFloat(document.getElementById('btAmount').value),
+                max_simultaneous: parseInt(document.getElementById('btMaxTrades').value),
+                top_n: parseInt(document.getElementById('btCoins').value),
+                double_bottom: document.getElementById('btDoubleBottom').value === 'on',
+                pump_enabled: document.getElementById('btPumpEnabled').value === 'on',
+                pump_tp: parseFloat(document.getElementById('btPumpTP').value),
+                pump_sl: parseFloat(document.getElementById('btPumpSL').value),
+                mode: document.getElementById('btMode').value,
+                pump_threshold: parseFloat(document.getElementById('btPumpThreshold').value),
+                pump_window_seconds: parseInt(document.getElementById('btPumpWindow').value),
+                coin_range_start: parseInt(document.getElementById('btCoinRange').value)
+            };
+            let payload = lastPayload;
+            if (payload.mode === 'tick') {
+                payload.top_n = 20;
+                msg.textContent = 'Running tick-by-tick backtest... this may take a few minutes...';
+            } else if (payload.mode === 'hybrid') {
+                msg.textContent = 'Running hybrid backtest... scanning all coins with candles, then minute precision for exits... this may take several minutes...';
+            }
+
+            try {
+                let resp = await fetch('api/backtest', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                let data = await resp.json();
+                if (data.error) {
+                    msg.textContent = 'Error: ' + data.error;
+                    msg.className = 'settings-msg error';
+                } else {
+                    let s = data.summary;
+                    msg.textContent = `Backtest complete: ${s.total_trades} trades in ${data.coins_scanned} coins (${data.scan_time_seconds}s)`;
+                    let pnlClass = s.total_pnl >= 0 ? 'pnl-positive' : 'pnl-negative';
+                    summary.innerHTML = `<div class="stats-grid" style="margin-top:8px">
+                        <div class="stat-card"><div class="label">Total Trades</div><div class="value">${s.total_trades}</div></div>
+                        <div class="stat-card"><div class="label">Win Rate</div><div class="value">${formatNumber(s.win_rate,1)}%</div></div>
+                        <div class="stat-card"><div class="label">Total P&L</div><div class="value ${pnlClass}">${formatNumber(s.total_pnl,2)} USDT</div></div>
+                        <div class="stat-card"><div class="label">Avg Win</div><div class="value pnl-positive">+${formatNumber(s.avg_win,2)}%</div></div>
+                        <div class="stat-card"><div class="label">Avg Loss</div><div class="value pnl-negative">${formatNumber(s.avg_loss,2)}%</div></div>
+                        <div class="stat-card"><div class="label">Best Trade</div><div class="value ${s.best_trade >= 0 ? 'pnl-positive' : 'pnl-negative'}">${s.best_trade >= 0 ? '+' : ''}${formatNumber(s.best_trade,2)}%</div></div>
+                        <div class="stat-card"><div class="label">Worst Trade</div><div class="value pnl-negative">${formatNumber(s.worst_trade,2)}%</div></div>
+                        <div class="stat-card"><div class="label">Wins / Losses</div><div class="value">${s.wins} / ${s.losses}</div></div>
+                        <div class="stat-card"><div class="label">Crash / Pump</div><div class="value">${s.crash_trades || 0} / ${s.pump_trades || 0}</div></div>
+                        <div class="stat-card"><div class="label">Max Simultaneous</div><div class="value">${s.max_simultaneous || 0} trades</div></div>
+                        <div class="stat-card"><div class="label">Max Capital Needed</div><div class="value">${formatNumber(s.max_capital_needed || 0, 0)} USDT</div></div>
+                        <div class="stat-card"><div class="label">Trades Skipped</div><div class="value">${s.trades_skipped || 0}</div></div>
+                        <div class="stat-card"><div class="label">Avg Duration</div><div class="value">${s.avg_duration_hours < 24 ? formatNumber(s.avg_duration_hours,1) + 'h' : formatNumber(s.avg_duration_hours/24,1) + 'd'}</div></div>
+                    </div>`;
+                    if (data.trades.length > 0) {
+                        let html = '<table><tr><th>#</th><th>Pair</th><th>Type</th><th>Entry Date</th><th>Exit Date</th><th>Duration</th><th>Entry</th><th>Exit</th><th>P&L %</th><th>P&L USDT</th><th>Exit Reason</th></tr>';
+                        data.trades.forEach((t, i) => {
+                            let cls = t.pnl_pct >= 0 ? 'pnl-positive' : 'pnl-negative';
+                            let typeCls = t.entry_type === 'pump' ? 'color:#3fb950' : 'color:#f85149';
+                            let typeLabel = (t.entry_type || 'crash').toUpperCase();
+                            let dur = '';
+                            if (t.exit_date && t.entry_date) {
+                                let ms = new Date(t.exit_date) - new Date(t.entry_date);
+                                let secs = Math.floor(ms / 1000);
+                                let d = Math.floor(secs / 86400); secs %= 86400;
+                                let h = Math.floor(secs / 3600); secs %= 3600;
+                                let m = Math.floor(secs / 60); let s = secs % 60;
+                                if (d > 0) dur = d + 'd ' + h + 'h ' + m + 'm';
+                                else if (h > 0) dur = h + 'h ' + m + 'm ' + s + 's';
+                                else if (m > 0) dur = m + 'm ' + s + 's';
+                                else dur = s + 's';
+                            }
+                            html += `<tr>
+                                <td>${i+1}</td>
+                                <td><strong>${t.symbol}</strong></td>
+                                <td style="${typeCls}">${typeLabel}</td>
+                                <td>${t.entry_date}</td>
+                                <td>${t.exit_date || '-'}</td>
+                                <td>${dur}</td>
+                                <td>${formatNumber(t.entry_price, 8)}</td>
+                                <td>${formatNumber(t.exit_price, 8)}</td>
+                                <td class="${cls}">${t.pnl_pct >= 0 ? '+' : ''}${formatNumber(t.pnl_pct, 2)}%</td>
+                                <td class="${cls}">${t.pnl_usdt >= 0 ? '+' : ''}${formatNumber(t.pnl_usdt, 2)}</td>
+                                <td>${t.exit_reason}</td>
+                            </tr>`;
+                        });
+                        html += '</table>';
+                        if (payload.mode === 'hybrid' || payload.mode === 'candle') {
+                            lastHybridData = data;
+                            html += '<div style="margin-top:16px;text-align:center"><button id="btnRefine" style="background:#238636;color:#fff;border:none;padding:10px 24px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:600">Refine with Tick-by-Tick Data</button></div>';
+                        }
+                        results.innerHTML = html;
+                        var refBtn = document.getElementById('btnRefine');
+                        if (refBtn) refBtn.addEventListener('click', refineWithTicks);
+                    }
+                }
+            } catch(e) {
+                msg.textContent = 'Backtest failed: ' + e.message;
+                msg.className = 'settings-msg error';
+            }
+            btn.disabled = false;
+        }
+
+        async function applyPaperTrading() {
+            let btn = document.getElementById('btnPaperTrade');
+            let msg = document.getElementById('btMsg');
+            btn.disabled = true;
+            msg.textContent = 'Applying settings to paper trading...';
+            msg.className = 'settings-msg';
+            try {
+                let payload = {
+                    drop_threshold_percent: parseFloat(document.getElementById('btThreshold').value),
+                    time_windows_minutes: [parseInt(document.getElementById('btWindow').value)],
+                    take_profit_percent: parseFloat(document.getElementById('btTP').value),
+                    stop_loss_percent: parseFloat(document.getElementById('btSL').value),
+                    amount_per_trade_eur: parseFloat(document.getElementById('btAmount').value),
+                    max_duration_hours: parseFloat(document.getElementById('btMaxDuration').value),
+                    max_simultaneous_trades: parseInt(document.getElementById('btMaxTrades').value),
+                    trading_pairs_limit: parseInt(document.getElementById('btCoins').value),
+                    pump_detection: document.getElementById('btPumpEnabled').value === 'on',
+                    pump_threshold_percent: parseFloat(document.getElementById('btPumpThreshold').value),
+                    pump_window_seconds: parseInt(document.getElementById('btPumpWindow').value),
+                    pump_tp: parseFloat(document.getElementById('btPumpTP').value),
+                    pump_sl: parseFloat(document.getElementById('btPumpSL').value)
+                };
+                let resp = await fetch('api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                let data = await resp.json();
+                if (data.success) {
+                    msg.textContent = 'Settings applied! Monitor now using new parameters (live update, no restart needed).';
+                    msg.className = 'settings-msg';
+                } else {
+                    msg.textContent = 'Error: ' + (data.error || 'Unknown');
+                    msg.className = 'settings-msg error';
+                }
+            } catch(e) {
+                msg.textContent = 'Failed: ' + e.message;
+                msg.className = 'settings-msg error';
+            }
+            btn.disabled = false;
+        }
+
+        function toggleSettings() {
+            let body = document.getElementById('settingsBody');
+            body.style.display = body.style.display === 'none' ? 'block' : 'none';
+        }
+
+        async function saveSettings() {
+            let btn = document.getElementById('btnSave');
+            let msg = document.getElementById('settingsMsg');
+            btn.disabled = true;
+            msg.textContent = 'Saving...';
+            msg.className = 'settings-msg';
+
+            let windowsStr = document.getElementById('setWindows').value;
+            let windows = windowsStr.split(',').map(w => parseFloat(w.trim())).filter(w => !isNaN(w) && w > 0);
+            if (windows.length === 0) {
+                msg.textContent = 'Invalid time windows';
+                msg.className = 'settings-msg error';
+                btn.disabled = false;
+                return;
+            }
+
+            let payload = {
+                drop_threshold_percent: parseFloat(document.getElementById('setThreshold').value),
+                time_windows_minutes: windows,
+                amount_per_trade_eur: parseFloat(document.getElementById('setAmount').value),
+                amount_per_trade_usdc: parseFloat(document.getElementById('setAmountUsdc').value),
+                take_profit_percent: parseFloat(document.getElementById('setTP').value),
+                stop_loss_percent: parseFloat(document.getElementById('setSL').value),
+                mode: document.getElementById('setMode').value,
+                reversal_mode: document.getElementById('setEntry').value,
+                double_bottom_enabled: document.getElementById('setDoubleBottom').value === 'on',
+                pump_detection: document.getElementById('setPump').value === 'on',
+                pump_threshold_percent: parseFloat(document.getElementById('setPumpThreshold').value),
+                pump_window_seconds: parseInt(document.getElementById('setPumpWindow').value),
+                trading_pairs_limit: parseInt(document.getElementById('setCoins').value),
+                max_simultaneous_trades: parseInt(document.getElementById('setMaxTrades').value),
+                max_usdc_trades: parseInt(document.getElementById('setMaxUsdc').value),
+                use_eur_convert: document.getElementById('chkConvert').value === 'on',
+                use_usdc_spot: document.getElementById('chkUsdc').value === 'on'
+            };
+
+            if (!payload.use_eur_convert && !payload.use_usdc_spot) {
+                msg.textContent = 'At least one trade method must be enabled!';
+                msg.className = 'settings-msg error';
+                btn.disabled = false;
+                return;
+            }
+
+
+            try {
+                let resp = await fetch('api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                let result = await resp.json();
+                if (result.success) {
+                    msg.textContent = 'Settings saved and applied!';
+                    msg.className = 'settings-msg';
+                } else {
+                    msg.textContent = 'Error: ' + (result.error || 'Unknown');
+                    msg.className = 'settings-msg error';
+                }
+            } catch(e) {
+                msg.textContent = 'Failed to save: ' + e.message;
+                msg.className = 'settings-msg error';
+            }
+            btn.disabled = false;
+        }
+
+        // Restore conditional close state on page load
+        (async function() {
+            try {
+                let r = await fetch('/api/conditional-close/status');
+                let d = await r.json();
+                if (d.sel && d.sel.active) {
+                    condSelActive = true;
+                    document.getElementById('btnCondSelActivate').textContent = 'DEACTIVATE';
+                    document.getElementById('btnCondSelActivate').style.background = '#e74c3c';
+                    if (d.sel.tp_usdt) document.getElementById('condSelTp').value = d.sel.tp_usdt;
+                    if (d.sel.tp_book) document.getElementById('condSelTpBook').value = d.sel.tp_book;
+                    if (d.sel.sl_usdt) document.getElementById('condSelSl').value = d.sel.sl_usdt;
+                    if (d.sel.sl_book) document.getElementById('condSelSlBook').value = d.sel.sl_book;
+                    var parts = [];
+                    if (d.sel.tp_usdt) parts.push('TP: ' + d.sel.tp_usdt);
+                    if (d.sel.tp_book) parts.push('TP Book: ' + d.sel.tp_book);
+                    if (d.sel.sl_usdt) parts.push('SL: -' + d.sel.sl_usdt);
+                    if (d.sel.sl_book) parts.push('SL Book: -' + d.sel.sl_book);
+                    document.getElementById('condSelStatus').innerHTML = '<span style="color:#f0883e;">ACTIVE: ' + d.sel.count + ' pos | ' + parts.join(' | ') + ' USDT</span>';
+                }
+                if (d.all && d.all.active) {
+                    condAllActive = true;
+                    document.getElementById('btnCondAllActivate').textContent = 'DEACTIVATE';
+                    document.getElementById('btnCondAllActivate').style.background = '#e74c3c';
+                    if (d.all.tp_usdt) document.getElementById('condAllTp').value = d.all.tp_usdt;
+                    if (d.all.tp_book) document.getElementById('condAllTpBook').value = d.all.tp_book;
+                    if (d.all.sl_usdt) document.getElementById('condAllSl').value = d.all.sl_usdt;
+                    if (d.all.sl_book) document.getElementById('condAllSlBook').value = d.all.sl_book;
+                    var parts = [];
+                    if (d.all.tp_usdt) parts.push('TP: ' + d.all.tp_usdt);
+                    if (d.all.tp_book) parts.push('TP Book: ' + d.all.tp_book);
+                    if (d.all.sl_usdt) parts.push('SL: -' + d.all.sl_usdt);
+                    if (d.all.sl_book) parts.push('SL Book: -' + d.all.sl_book);
+                    document.getElementById('condAllStatus').innerHTML = '<span style="color:#f0883e;">ACTIVE: ALL pos | ' + parts.join(' | ') + ' USDT</span>';
+                }
+            } catch(e) {}
+        })();
+
+        // Refresh every 5 seconds
+        refresh();
+        setInterval(refresh, 5000);
+    </script>
+</body>
+</html>
+"""
+
+
+def create_app(config: dict, database: Database, detector_ref: list) -> Flask:
+    """Create and configure the Flask dashboard application."""
+
+    app = Flask(__name__)
+    app.config["JSON_SORT_KEYS"] = False
+
+    from flask import session, redirect, url_for
+    app.secret_key = config.get("dashboard", {}).get("password", "") + "_secret_key_2026"
+    dashboard_password = config.get("dashboard", {}).get("password", "")
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        error = None
+        if request.method == "POST":
+            if request.form.get("password") == dashboard_password:
+                session["authenticated"] = True
+                return redirect("/")
+            error = "Wrong password"
+        return render_template_string(LOGIN_HTML, error=error)
+
+    @app.route("/logout")
+    def logout():
+        session.pop("authenticated", None)
+        return redirect("/login")
+
+    @app.before_request
+    def require_auth():
+        if not dashboard_password:
+            return
+        if request.endpoint in ("login", "forgot_password", "static"):
+            return
+        if not session.get("authenticated"):
+            return redirect("/login")
+
+    security_question = config.get("dashboard", {}).get("security_question", "")
+    security_answer = config.get("dashboard", {}).get("security_answer", "")
+
+    @app.route("/forgot", methods=["GET", "POST"])
+    def forgot_password():
+        error = None
+        success = None
+        if request.method == "POST":
+            answer = request.form.get("answer", "").strip().lower()
+            new_pw = request.form.get("new_password", "")
+            confirm_pw = request.form.get("confirm_password", "")
+            if answer != security_answer.lower():
+                error = "Wrong answer"
+            elif len(new_pw) < 4:
+                error = "Password must be at least 4 characters"
+            elif new_pw != confirm_pw:
+                error = "Passwords do not match"
+            else:
+                nonlocal dashboard_password
+                dashboard_password = new_pw
+                config["dashboard"]["password"] = new_pw
+                cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+                try:
+                    with open(cfg_path, "w") as cf:
+                        import json as _json
+                        _json.dump(config, cf, indent=4)
+                except Exception:
+                    pass
+                success = "Password changed successfully!"
+                logger.info("Password changed via security question")
+        return render_template_string(FORGOT_HTML, question=security_question, error=error, success=success)
+
+    cond_sel = {"active": False, "ids": [], "tp_usdt": None, "tp_book": None, "sl_usdt": None, "sl_book": None, "triggered": None}
+    cond_all = {"active": False, "tp_usdt": None, "tp_book": None, "sl_usdt": None, "sl_book": None, "triggered": None}
+
+    import json as _json
+    _cond_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cond_close.json")
+
+    def _save_cond():
+        try:
+            _json.dump({"sel": {k: v for k, v in cond_sel.items() if k != "triggered"},
+                         "all": {k: v for k, v in cond_all.items() if k != "triggered"}},
+                        open(_cond_file, "w"))
+        except Exception:
+            pass
+
+    def _load_cond():
+        try:
+            if os.path.exists(_cond_file):
+                d = _json.load(open(_cond_file))
+                if d.get("sel"):
+                    cond_sel.update({k: v for k, v in d["sel"].items() if k != "triggered"})
+                if d.get("all"):
+                    cond_all.update({k: v for k, v in d["all"].items() if k != "triggered"})
+        except Exception:
+            pass
+
+    _load_cond()
+
+    # Create trader instance for live sell operations
+    trader = BinanceTrader(config)
+
+    def _parse_dt(s):
+        from datetime import datetime
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+
+    detection_cfg = config.get("detection", {})
+    trading_cfg = config.get("trading", {})
+
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+    @app.route("/")
+    def index():
+        """Render the main dashboard."""
+        return render_template_string(
+            DASHBOARD_HTML,
+            threshold=detection_cfg.get("drop_threshold_percent", 30),
+            windows=", ".join(str(w) for w in detection_cfg.get("time_windows_minutes", [7, 15])),
+            amount=trading_cfg.get("amount_per_trade_eur", 1000),
+            amount_usdc=trading_cfg.get("amount_per_trade_usdc", 500),
+            tp=trading_cfg.get("take_profit_percent", 50),
+            sl=trading_cfg.get("stop_loss_percent", 20),
+            mode=trading_cfg.get("mode", "demo"),
+            entry=trading_cfg.get("reversal_mode", "instant"),
+            dbl_bottom=trading_cfg.get("double_bottom_enabled", False),
+            pump_on=detection_cfg.get("pump_detection", True),
+            pump_threshold=detection_cfg.get("pump_threshold_percent", 5),
+            pump_window=detection_cfg.get("pump_window_seconds", 5),
+            trading_coins=config.get("binance", {}).get("top_pairs_count", 500),
+            max_trades=trading_cfg.get("max_simultaneous_trades", 0),
+            max_eur_trades=trading_cfg.get("max_eur_trades", 0),
+            max_usdc_trades=trading_cfg.get("max_usdc_trades", 0),
+            use_convert=trading_cfg.get("use_eur_convert", True),
+            use_usdc=trading_cfg.get("use_usdc_spot", True)
+        )
+
+    @app.route("/api/data")
+    def api_data():
+        """Get all dashboard data in one call."""
+        # Get detector stats
+        stats = {
+            "symbols_monitored": 0,
+            "messages_received": 0,
+            "crashes_detected": 0,
+            "trades_opened": 0,
+            "trades_skipped_limit": 0,
+            "trades_skipped_funds": 0,
+            "max_simultaneous_open": 0,
+            "ws_connected": False,
+            "uptime": 0
+        }
+        if detector_ref:
+            detector = detector_ref[0]
+            stats = dict(detector.stats)
+            stats["uptime"] = time.time() - stats.get("start_time", time.time())
+            stats["trading_mode"] = "live" if detector.live_mode else "demo"
+            stats["trading_enabled"] = detector.trading_enabled
+            stats["active_config"] = {
+                "threshold": detector.drop_threshold,
+                "windows": detector.time_windows,
+                "tp": detector.take_profit,
+                "sl": detector.stop_loss,
+                "amount": detector.trade_amount,
+                "max_trades": detector.max_simultaneous_trades,
+                "coins": detector.trading_pairs_limit
+            }
+
+        # Get top drops from all monitored symbols (deduplicated by symbol)
+        top_drops = []
+        if detector_ref:
+            detector = detector_ref[0]
+            windows_min = detector.time_windows
+            best_drops = {}
+            for symbol, pw in list(detector.windows.items()):
+                for wm in windows_min:
+                    result = pw.get_drop_percent(wm * 60)
+                    if result and result[0] > 0.01:
+                        if symbol not in best_drops or result[0] > best_drops[symbol]["drop"]:
+                            best_drops[symbol] = {
+                                "symbol": symbol,
+                                "drop": round(result[0], 2),
+                                "high": result[1],
+                                "current": result[2],
+                                "window": wm
+                            }
+            top_drops = sorted(best_drops.values(), key=lambda x: x["drop"], reverse=True)[:50]
+
+        # Calculate extended portfolio with book prices
+        import requests as req
+        rest = config.get("binance", {}).get("rest_url", "https://api.binance.com")
+        eur_rate = 0
+        try:
+            er = req.get(f"{rest}/api/v3/ticker/price", params={"symbol": "EURUSDT"}, timeout=3)
+            eur_rate = float(er.json()["price"])
+        except Exception:
+            pass
+        open_trades_list = database.get_open_trades()
+        portfolio_ext = {"open_count": len(open_trades_list), "total_invested": 0,
+                         "current_value": 0, "total_pnl": 0, "pnl_book": 0, "eur_rate": eur_rate}
+        if open_trades_list:
+            portfolio_ext["total_invested"] = sum(t["quantity"] * t["entry_price"] for t in open_trades_list)
+            portfolio_ext["total_invested_eur"] = sum(t["amount_eur"] if t.get("is_live") else (t["quantity"] * t["entry_price"] / eur_rate if eur_rate > 0 else 0) for t in open_trades_list)
+            for t in open_trades_list:
+                cp = t.get("current_price") or t["entry_price"]
+                portfolio_ext["current_value"] += t["quantity"] * cp
+                try:
+                    ob = req.get(f"{rest}/api/v3/depth", params={"symbol": t["symbol"], "limit": 50}, timeout=3).json()
+                    bids = ob.get("bids", [])
+                    best_bid = float(bids[0][0]) if bids else cp
+                    remaining = t["quantity"]
+                    total_quote = 0.0
+                    levels_used = 0
+                    for ps, qs in bids:
+                        px, qx = float(ps), float(qs)
+                        fill = min(remaining, qx)
+                        total_quote += fill * px
+                        remaining -= fill
+                        levels_used += 1
+                        if remaining <= 0:
+                            break
+                    fill_avg = total_quote / t["quantity"] if t["quantity"] > 0 and remaining <= 0 else best_bid
+                    slip_pct = ((best_bid - fill_avg) / best_bid * 100) if best_bid > 0 else 0
+                    t["fill_avg"] = round(fill_avg, 10)
+                    t["slip_pct"] = round(slip_pct, 3)
+                    t["book_levels"] = levels_used
+                except Exception:
+                    best_bid = cp
+                    t["fill_avg"] = cp
+                    t["slip_pct"] = 0
+                    t["book_levels"] = 0
+                t["book_price"] = best_bid
+            portfolio_ext["current_value"] = round(portfolio_ext["current_value"], 2)
+            portfolio_ext["total_pnl"] = round(portfolio_ext["current_value"] - portfolio_ext["total_invested"], 2)
+            book_value = sum(t["quantity"] * t.get("book_price", t["entry_price"]) for t in open_trades_list)
+            portfolio_ext["pnl_book"] = round(book_value - portfolio_ext["total_invested"], 2)
+            if eur_rate > 0:
+                portfolio_ext["total_pnl_eur"] = round(portfolio_ext["total_pnl"] / eur_rate, 2)
+                portfolio_ext["pnl_book_eur"] = round(portfolio_ext["pnl_book"] / eur_rate, 2)
+
+        def _check_cond(rule, trades):
+            invested = sum(t["quantity"] * t["entry_price"] for t in trades)
+            value = sum(t["quantity"] * (t.get("current_price") or t["entry_price"]) for t in trades)
+            pnl = value - invested
+            book_val = sum(t["quantity"] * t.get("book_price", t["entry_price"]) for t in trades)
+            book_pnl = book_val - invested
+            tp = rule.get("tp_usdt")
+            if tp and pnl >= tp:
+                return "TP", pnl
+            tp_b = rule.get("tp_book")
+            if tp_b and book_pnl >= tp_b:
+                return "TP Book", book_pnl
+            sl = rule.get("sl_usdt")
+            if sl and pnl <= -sl:
+                return "SL", pnl
+            sl_b = rule.get("sl_book")
+            if sl_b and book_pnl <= -sl_b:
+                return "SL Book", book_pnl
+            return None, 0
+
+        triggered_list = []
+        if cond_sel.get("triggered"):
+            triggered_list.append(cond_sel["triggered"])
+            cond_sel["triggered"] = None
+        if cond_all.get("triggered"):
+            triggered_list.append(cond_all["triggered"])
+            cond_all["triggered"] = None
+
+        if cond_sel.get("active") and open_trades_list:
+            sel_ids = set(cond_sel.get("ids", []))
+            sel_trades = [t for t in open_trades_list if t["id"] in sel_ids]
+            if sel_trades:
+                reason, val = _check_cond(cond_sel, sel_trades)
+                if reason:
+                    closed_count = 0
+                    for t in sel_trades:
+                        try:
+                            if trader.live_mode:
+                                result = trader.market_sell(t["symbol"], t["quantity"])
+                                if not result:
+                                    logger.error(f"COND SEL LIVE SELL FAILED: {t['symbol']} #{t['id']} - kept open")
+                                    continue
+                                cp = result["avg_price"]
+                                logger.info(f"COND SEL {reason} LIVE: {t['symbol']} #{t['id']} sold -> {result.get('eur_received', 0):.2f} EUR")
+                            else:
+                                bp = _get_book_price(t["symbol"], t["quantity"])
+                                cp = bp if bp else (t.get("current_price") or t["entry_price"])
+                                logger.info(f"COND SEL {reason} (book): {t['symbol']} #{t['id']} closed at {cp:.8g}")
+                            database.close_trade(t["id"], cp, "A")
+                            closed_count += 1
+                        except Exception as ex:
+                            logger.error(f"Cond sel close error #{t['id']}: {ex}")
+                    cond_sel.update({"active": False, "ids": []})
+                    _save_cond()
+                    trig = {"mode": "sel", "reason": reason, "value": val, "closed": closed_count}
+                    cond_sel["triggered"] = trig
+                    triggered_list.append(trig)
+                    open_trades_list = database.get_open_trades()
+
+        if cond_all.get("active") and open_trades_list:
+            reason, val = _check_cond(cond_all, open_trades_list)
+            if reason:
+                closed_count = 0
+                for t in open_trades_list:
+                    try:
+                        if trader.live_mode:
+                            result = trader.market_sell(t["symbol"], t["quantity"])
+                            if not result:
+                                logger.error(f"COND ALL LIVE SELL FAILED: {t['symbol']} #{t['id']} - kept open")
+                                continue
+                            cp = result["avg_price"]
+                            logger.info(f"COND ALL {reason} LIVE: {t['symbol']} #{t['id']} sold -> {result.get('eur_received', 0):.2f} EUR")
+                        else:
+                            bp = _get_book_price(t["symbol"], t["quantity"])
+                            cp = bp if bp else (t.get("current_price") or t["entry_price"])
+                            logger.info(f"COND ALL {reason} (book): {t['symbol']} #{t['id']} closed at {cp:.8g}")
+                        database.close_trade(t["id"], cp, "A")
+                        closed_count += 1
+                    except Exception as ex:
+                        logger.error(f"Cond all close error #{t['id']}: {ex}")
+                cond_all["active"] = False
+                _save_cond()
+                trig = {"mode": "all", "reason": reason, "value": val, "closed": closed_count}
+                cond_all["triggered"] = trig
+                triggered_list.append(trig)
+                open_trades_list = database.get_open_trades()
+
+        resp_data = {
+            "stats": stats,
+            "top_drops": top_drops,
+            "crashes": database.get_recent_crashes(50),
+            "crashes_24h": database.get_crash_count_24h(),
+            "open_trades": open_trades_list,
+            "closed_trades": database.get_closed_trades(50),
+            "portfolio": database.get_portfolio_summary(),
+            "portfolio_ext": portfolio_ext
+        }
+        if triggered_list:
+            resp_data["conditional_triggered"] = triggered_list
+        resp_data["quota"] = trader.get_quota_info() if hasattr(trader, "get_quota_info") else {}
+
+        # Fetch Binance balances
+        binance_bal = {"eur": 0, "usdc": 0}
+        if trader.live_mode and trader.api_key:
+            try:
+                import requests as _req
+                bal_params = trader._sign({})
+                bal_resp = _req.get(
+                    f"{trader.rest_url}/api/v3/account",
+                    params=bal_params,
+                    headers={"X-MBX-APIKEY": trader.api_key},
+                    timeout=5
+                )
+                if bal_resp.status_code == 200:
+                    all_balances = {}
+                    for b in bal_resp.json().get("balances", []):
+                        bal_total = float(b["free"]) + float(b["locked"])
+                        if b["asset"] == "EUR":
+                            binance_bal["eur"] = bal_total
+                        elif b["asset"] == "USDC":
+                            binance_bal["usdc"] = bal_total
+                        if bal_total > 0:
+                            all_balances[b["asset"]] = bal_total
+
+                    # Auto-sync: update position quantities to match Binance
+                    for t in open_trades_list:
+                        asset = t["symbol"].replace("USDT", "")
+                        binance_qty = all_balances.get(asset, 0)
+                        if binance_qty == 0 and t.get("is_live"):
+                            database.close_trade(t["id"], t.get("current_price") or t["entry_price"], "A")
+                            logger.info(f"AUTO-SYNC: Closed {t['symbol']} #{t['id']} - no balance on Binance")
+                        elif abs(binance_qty - t["quantity"]) > t["quantity"] * 0.01 and t.get("is_live"):
+                            database.update_trade_quantity(t["id"], binance_qty)
+                            logger.info(f"AUTO-SYNC: Updated {t['symbol']} #{t['id']} qty {t['quantity']:.2f} -> {binance_qty:.2f}")
+                    open_trades_list = database.get_open_trades()
+            except Exception as e:
+                logger.debug(f"Balance fetch error: {e}")
+        resp_data["binance_balances"] = binance_bal
+
+        # Total Portfolio Value (all assets in USDT/EUR)
+        total_portfolio_usdt = 0.0
+        if eur_rate > 0:
+            total_portfolio_usdt += binance_bal["eur"] * eur_rate
+        total_portfolio_usdt += binance_bal["usdc"]
+        if portfolio_ext.get("current_value"):
+            total_portfolio_usdt += portfolio_ext["current_value"]
+        resp_data["total_portfolio"] = {
+            "usdc": round(total_portfolio_usdt, 2),
+            "eur": round(total_portfolio_usdt / eur_rate, 2) if eur_rate > 0 else 0
+        }
+
+        # PNL Today (change since midnight, auto-adjusting for deposits/withdrawals)
+        import datetime as _dt
+        _snap_file = os.path.join(os.path.dirname(__file__), "daily_snapshot.json")
+        _today = _dt.date.today().isoformat()
+        _snap = {}
+        try:
+            if os.path.exists(_snap_file):
+                with open(_snap_file) as _sf:
+                    _snap = json.load(_sf)
+        except Exception:
+            _snap = {}
+        if _snap.get("date") != _today and total_portfolio_usdt > 0:
+            _snap = {"date": _today, "value_usdt": total_portfolio_usdt, "adjustments": 0}
+            try:
+                with open(_snap_file, "w") as _sf:
+                    json.dump(_snap, _sf)
+            except Exception:
+                pass
+
+        # Auto-detect deposits/withdrawals via Binance API (fiat SEPA + crypto)
+        _adj = _snap.get("adjustments", 0)
+        _last_check = _snap.get("last_dep_check", 0)
+        _now_ts = time.time()
+        if trader.api_key and (_now_ts - _last_check) > 300:
+            try:
+                import requests as _dreq
+                _midnight = int(_dt.datetime.combine(_dt.date.today(), _dt.time.min).timestamp() * 1000)
+                _dep_total_eur = 0
+                _wit_total_eur = 0
+
+                # 1. Fiat deposits (SEPA bank transfers, card)
+                _fiat_dep_params = trader._sign({"transactionType": "0", "beginTime": str(_midnight), "rows": "100"})
+                _fiat_dep_resp = _dreq.get(
+                    f"{trader.rest_url}/sapi/v1/fiat/orders",
+                    params=_fiat_dep_params,
+                    headers={"X-MBX-APIKEY": trader.api_key},
+                    timeout=5
+                )
+                if _fiat_dep_resp.status_code == 200:
+                    _fiat_data = _fiat_dep_resp.json()
+                    for d in _fiat_data.get("data", []):
+                        if d.get("status") == "Successful":
+                            _dep_total_eur += float(d.get("amount", 0))
+
+                # 2. Fiat withdrawals (SEPA bank transfers)
+                _fiat_wit_params = trader._sign({"transactionType": "1", "beginTime": str(_midnight), "rows": "100"})
+                _fiat_wit_resp = _dreq.get(
+                    f"{trader.rest_url}/sapi/v1/fiat/orders",
+                    params=_fiat_wit_params,
+                    headers={"X-MBX-APIKEY": trader.api_key},
+                    timeout=5
+                )
+                if _fiat_wit_resp.status_code == 200:
+                    _fiat_data = _fiat_wit_resp.json()
+                    for w in _fiat_data.get("data", []):
+                        if w.get("status") == "Successful":
+                            _wit_total_eur += float(w.get("amount", 0))
+
+                # Convert fiat EUR to USDT
+                _dep_total = _dep_total_eur * eur_rate if eur_rate > 0 else 0
+                _wit_total = _wit_total_eur * eur_rate if eur_rate > 0 else 0
+
+                # 3. Crypto deposits (external wallet transfers)
+                _crypto_dep_params = trader._sign({"startTime": _midnight, "status": 1})
+                _crypto_dep_resp = _dreq.get(
+                    f"{trader.rest_url}/sapi/v1/capital/deposit/hisrec",
+                    params=_crypto_dep_params,
+                    headers={"X-MBX-APIKEY": trader.api_key},
+                    timeout=5
+                )
+                if _crypto_dep_resp.status_code == 200:
+                    for d in _crypto_dep_resp.json():
+                        amt = float(d.get("amount", 0))
+                        coin = d.get("coin", "")
+                        if coin in ("USDT", "USDC"):
+                            _dep_total += amt
+                        else:
+                            try:
+                                _p = _dreq.get(f"{trader.rest_url}/api/v3/ticker/price", params={"symbol": f"{coin}USDT"}, timeout=3)
+                                _dep_total += amt * float(_p.json()["price"])
+                            except Exception:
+                                pass
+
+                # 4. Crypto withdrawals (external wallet transfers)
+                _crypto_wit_params = trader._sign({"startTime": _midnight, "status": 6})
+                _crypto_wit_resp = _dreq.get(
+                    f"{trader.rest_url}/sapi/v1/capital/withdraw/history",
+                    params=_crypto_wit_params,
+                    headers={"X-MBX-APIKEY": trader.api_key},
+                    timeout=5
+                )
+                if _crypto_wit_resp.status_code == 200:
+                    for w in _crypto_wit_resp.json():
+                        amt = float(w.get("amount", 0))
+                        coin = w.get("coin", "")
+                        if coin in ("USDT", "USDC"):
+                            _wit_total += amt
+                        else:
+                            try:
+                                _p = _dreq.get(f"{trader.rest_url}/api/v3/ticker/price", params={"symbol": f"{coin}USDT"}, timeout=3)
+                                _wit_total += amt * float(_p.json()["price"])
+                            except Exception:
+                                pass
+
+                _new_adj = round(_dep_total - _wit_total, 2)
+                if _new_adj != _adj:
+                    logger.info(f"PNL adjustment: fiat_dep={_dep_total_eur:.2f}EUR crypto_dep={_dep_total - _dep_total_eur * eur_rate:.2f}USDT fiat_wit={_wit_total_eur:.2f}EUR net={_new_adj:.2f}USDT")
+                _adj = _new_adj
+                _snap["adjustments"] = _adj
+                _snap["last_dep_check"] = _now_ts
+                try:
+                    with open(_snap_file, "w") as _sf:
+                        json.dump(_snap, _sf)
+                except Exception:
+                    pass
+            except Exception as _de:
+                logger.debug(f"Deposit/withdrawal check error: {_de}")
+
+        _base = _snap.get("value_usdt", total_portfolio_usdt) + _adj
+        _pnl_today = total_portfolio_usdt - _base
+        resp_data["pnl_today"] = {
+            "usdt": round(_pnl_today, 2),
+            "eur": round(_pnl_today / eur_rate, 2) if eur_rate > 0 else 0,
+            "pct": round(_pnl_today / _base * 100, 2) if _base > 0 else 0
+        }
+
+        response = jsonify(resp_data)
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return response
+
+    @app.route("/api/reset-skipped", methods=["POST"])
+    def reset_skipped():
+        if detector_ref:
+            det = detector_ref[0]
+            det.stats["trades_skipped_limit"] = 0
+            det.stats["trades_skipped_funds"] = 0
+        return jsonify({"success": True})
+
+    @app.route("/api/journal")
+    def api_journal():
+        if detector_ref:
+            det = detector_ref[0]
+            if hasattr(det, 'journal'):
+                return jsonify(det.journal.get_journal(60))
+        return jsonify({})
+
+    @app.route("/api/crashes")
+    def api_crashes():
+        """Get crash history."""
+        limit = request.args.get("limit", 100, type=int)
+        return jsonify(database.get_recent_crashes(limit))
+
+    @app.route("/api/trades")
+    def api_trades():
+        """Get all trades."""
+        return jsonify(database.get_all_trades())
+
+    @app.route("/api/portfolio")
+    def api_portfolio():
+        """Get portfolio summary."""
+        return jsonify(database.get_portfolio_summary())
+
+    @app.route("/api/stats")
+    def api_stats():
+        """Get monitor statistics."""
+        if detector_ref:
+            detector = detector_ref[0]
+            stats = dict(detector.stats)
+            stats["uptime"] = time.time() - stats.get("start_time", time.time())
+            return jsonify(stats)
+        return jsonify({"error": "Monitor not started"})
+
+    @app.route("/api/acknowledge/<int:crash_id>", methods=["POST"])
+    def acknowledge(crash_id):
+        """Acknowledge a crash alert."""
+        database.acknowledge_crash(crash_id)
+        return jsonify({"success": True})
+
+    @app.route("/api/history/scan", methods=["POST"])
+    def history_scan():
+        """Scan historical Binance data for crashes."""
+        import requests as req
+        from datetime import datetime
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        try:
+            data = request.get_json()
+            date_from = data.get("date_from")
+            date_to = data.get("date_to")
+            threshold = float(data.get("threshold", 20))
+            window_minutes = int(data.get("window_minutes", 15))
+            top_n = min(int(data.get("top_n", 100)), 500)
+
+            start_ts = int(datetime.strptime(date_from, "%Y-%m-%d").timestamp() * 1000)
+            end_ts = int(datetime.strptime(date_to + " 23:59:59", "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+
+            interval_map = {5: "5m", 15: "15m", 30: "30m", 60: "1h", 240: "4h", 1440: "1d"}
+            interval = interval_map.get(window_minutes, "15m")
+
+            rest_url = config.get("binance", {}).get("rest_url", "https://api.binance.com")
+            quote = config.get("binance", {}).get("quote_asset", "USDT")
+
+            scan_start = time.time()
+
+            resp = req.get(f"{rest_url}/api/v3/ticker/24hr", timeout=30)
+            tickers = resp.json()
+            usdt_pairs = [t for t in tickers if t["symbol"].endswith(quote) and float(t["quoteVolume"]) > 0]
+            usdt_pairs.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
+            symbols = [t["symbol"] for t in usdt_pairs[:top_n]]
+
+            def scan_symbol(symbol):
+                hits = []
+                try:
+                    all_klines = []
+                    cur = start_ts
+                    for _ in range(15):
+                        r = req.get(f"{rest_url}/api/v3/klines", params={
+                            "symbol": symbol, "interval": interval,
+                            "startTime": cur, "endTime": end_ts, "limit": 1000
+                        }, timeout=15)
+                        chunk = r.json()
+                        if not chunk or not isinstance(chunk, list):
+                            break
+                        all_klines.extend(chunk)
+                        if len(chunk) < 1000:
+                            break
+                        cur = chunk[-1][0] + 1
+                    klines = all_klines
+                    if not klines:
+                        return hits
+                    for i in range(len(klines)):
+                        high = float(klines[i][2])
+                        low = float(klines[i][3])
+                        if high == 0:
+                            continue
+                        close_price = float(klines[i][4])
+                        drop = ((high - low) / high) * 100
+                        if drop >= threshold:
+                            recovery_same = ((close_price - low) / low * 100) if low > 0 else 0
+                            best_recovery_price = close_price
+                            for j in range(i + 1, min(i + 11, len(klines))):
+                                future_high = float(klines[j][2])
+                                if future_high > best_recovery_price:
+                                    best_recovery_price = future_high
+                            recovery_10c = ((best_recovery_price - low) / low * 100) if low > 0 else 0
+                            ts = int(klines[i][0]) / 1000
+                            hits.append({
+                                "symbol": symbol,
+                                "date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M"),
+                                "drop_percent": round(drop, 2),
+                                "high_price": high,
+                                "low_price": low,
+                                "close_price": close_price,
+                                "recovery_same": round(recovery_same, 2),
+                                "recovery_10c": round(recovery_10c, 2)
+                            })
+                except Exception:
+                    pass
+                return hits
+
+            results = []
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                futures = {executor.submit(scan_symbol, s): s for s in symbols}
+                for future in as_completed(futures):
+                    results.extend(future.result())
+
+            results.sort(key=lambda x: x["drop_percent"], reverse=True)
+            scan_time = round(time.time() - scan_start, 1)
+
+            return jsonify({
+                "results": results[:200],
+                "coins_scanned": len(symbols),
+                "total_found": len(results),
+                "scan_time_seconds": scan_time
+            })
+
+        except Exception as e:
+            logger.error(f"History scan error: {e}")
+            return jsonify({"error": str(e)})
+
+    @app.route("/api/presets", methods=["GET"])
+    def get_presets():
+        presets_path = os.path.join(os.path.dirname(config_path), "presets.json")
+        try:
+            with open(presets_path, "r") as f:
+                return jsonify(json.load(f))
+        except Exception:
+            return jsonify({})
+
+    @app.route("/api/presets", methods=["POST"])
+    def save_preset():
+        presets_path = os.path.join(os.path.dirname(config_path), "presets.json")
+        data = request.get_json()
+        name = data.get("name", "")
+        preset = data.get("preset", {})
+        if not name:
+            return jsonify({"error": "No name"}), 400
+        try:
+            with open(presets_path, "r") as f:
+                presets = json.load(f)
+        except Exception:
+            presets = {}
+        presets[name] = preset
+        with open(presets_path, "w") as f:
+            json.dump(presets, f, indent=2)
+        return jsonify({"success": True})
+
+    @app.route("/api/presets", methods=["DELETE"])
+    def delete_preset():
+        presets_path = os.path.join(os.path.dirname(config_path), "presets.json")
+        data = request.get_json()
+        name = data.get("name", "")
+        try:
+            with open(presets_path, "r") as f:
+                presets = json.load(f)
+            presets.pop(name, None)
+            with open(presets_path, "w") as f:
+                json.dump(presets, f, indent=2)
+        except Exception:
+            pass
+        return jsonify({"success": True})
+
+    def _run_tick_backtest(req, rest_url, quote, start_ts, end_ts,
+                          crash_threshold, window_minutes, pump_threshold, pump_window_sec,
+                          take_profit, stop_loss, pump_tp, pump_sl,
+                          amount, top_n, max_simultaneous_limit, coin_range_start=0,
+                          max_duration_hours=0):
+        """Tick-by-tick backtest using Binance aggTrades API."""
+        from datetime import datetime
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time as tm
+
+        scan_start = tm.time()
+        window_sec = window_minutes * 60
+
+        resp = req.get(f"{rest_url}/api/v3/ticker/24hr", timeout=30)
+        tickers = resp.json()
+        usdt_pairs = [t for t in tickers if t["symbol"].endswith(quote) and float(t["quoteVolume"]) > 0]
+        usdt_pairs.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
+        range_end = coin_range_start + top_n
+        symbols = [t["symbol"] for t in usdt_pairs[coin_range_start:range_end]]
+
+        def tick_backtest_symbol(symbol):
+            trades = []
+            try:
+                # Step 1: fetch 1-min candles to find volatile periods
+                all_candles = []
+                cur = start_ts
+                for _ in range(15):
+                    r = req.get(f"{rest_url}/api/v3/klines", params={
+                        "symbol": symbol, "interval": "1m",
+                        "startTime": cur, "endTime": end_ts, "limit": 1000
+                    }, timeout=15)
+                    chunk = r.json()
+                    if not chunk or not isinstance(chunk, list):
+                        break
+                    all_candles.extend(chunk)
+                    if len(chunk) < 1000:
+                        break
+                    cur = chunk[-1][0] + 1
+
+                if not all_candles:
+                    return trades
+
+                # Step 2: find volatile windows (candles with >2% range = potential events)
+                hot_windows = []
+                for c in all_candles:
+                    h = float(c[2])
+                    l = float(c[3])
+                    if h > 0 and ((h - l) / h * 100) >= 2.0:
+                        ts_start = c[0] - pump_window_sec * 1000
+                        ts_end = c[0] + 120000
+                        hot_windows.append((ts_start, ts_end))
+
+                # Merge overlapping windows
+                if not hot_windows:
+                    return trades
+                hot_windows.sort()
+                merged = [hot_windows[0]]
+                for s, e in hot_windows[1:]:
+                    if s <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                    else:
+                        merged.append((s, e))
+
+                # Step 3: fetch ticks only for hot windows
+                all_ticks = []
+                for ws, we in merged[:50]:
+                    r = req.get(f"{rest_url}/api/v3/aggTrades", params={
+                        "symbol": symbol, "startTime": int(ws), "endTime": int(we), "limit": 1000
+                    }, timeout=10)
+                    chunk = r.json()
+                    if chunk and isinstance(chunk, list):
+                        all_ticks.extend(chunk)
+
+                if not all_ticks:
+                    return trades
+
+                all_ticks.sort(key=lambda x: x["T"])
+
+                # Step 4: simulate with tick data
+                price_window = deque()
+                in_trade = False
+                entry_price = 0
+                entry_time = 0
+                entry_type = "crash"
+                cooldown_until = 0
+
+                for tick in all_ticks:
+                    ts = tick["T"] / 1000
+                    price = float(tick["p"])
+                    price_window.append((ts, price))
+
+                    cutoff_crash = ts - window_sec
+                    cutoff_pump = ts - pump_window_sec
+                    while price_window and price_window[0][0] < min(cutoff_crash, cutoff_pump):
+                        price_window.popleft()
+
+                    if in_trade:
+                        tp = pump_tp if entry_type == "pump" else take_profit
+                        sl = pump_sl if entry_type == "pump" else stop_loss
+                        pnl = ((price - entry_price) / entry_price) * 100
+                        if pnl >= tp:
+                            exit_price = entry_price * (1 + tp / 100)
+                            trades.append({
+                                "symbol": symbol,
+                                "entry_date": datetime.fromtimestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S"),
+                                "exit_date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                                "entry_price": entry_price,
+                                "exit_price": round(exit_price, 8),
+                                "pnl_pct": round(tp, 2),
+                                "pnl_usdt": round(amount * tp / 100, 2),
+                                "exit_reason": "TP",
+                                "entry_type": entry_type
+                            })
+                            in_trade = False
+                            cooldown_until = ts + 300
+                        elif pnl <= -sl:
+                            exit_price = entry_price * (1 - sl / 100)
+                            trades.append({
+                                "symbol": symbol,
+                                "entry_date": datetime.fromtimestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S"),
+                                "exit_date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                                "entry_price": entry_price,
+                                "exit_price": round(exit_price, 8),
+                                "pnl_pct": round(-sl, 2),
+                                "pnl_usdt": round(-amount * sl / 100, 2),
+                                "exit_reason": "SL",
+                                "entry_type": entry_type
+                            })
+                            in_trade = False
+                            cooldown_until = ts + 300
+                        elif max_duration_hours > 0 and (ts - entry_time) >= max_duration_hours * 3600:
+                            trades.append({
+                                "symbol": symbol,
+                                "entry_date": datetime.fromtimestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S"),
+                                "exit_date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                                "entry_price": entry_price,
+                                "exit_price": round(price, 8),
+                                "pnl_pct": round(pnl, 2),
+                                "pnl_usdt": round(amount * pnl / 100, 2),
+                                "exit_reason": "TIME",
+                                "entry_type": entry_type
+                            })
+                            in_trade = False
+                            cooldown_until = ts + 300
+                    else:
+                        if ts < cooldown_until:
+                            continue
+
+                        max_price = 0
+                        min_price = float('inf')
+                        for t, p in price_window:
+                            if t >= cutoff_crash and p > max_price:
+                                max_price = p
+                            if t >= cutoff_pump and p < min_price:
+                                min_price = p
+
+                        if max_price > 0:
+                            drop = ((max_price - price) / max_price) * 100
+                            if drop >= crash_threshold:
+                                in_trade = True
+                                entry_price = price
+                                entry_time = ts
+                                entry_type = "crash"
+                                continue
+
+                        if min_price > 0 and min_price < float('inf'):
+                            pump_pct = ((price - min_price) / min_price) * 100
+                            if pump_pct >= pump_threshold:
+                                in_trade = True
+                                entry_price = price
+                                entry_time = ts
+                                entry_type = "pump"
+
+                if in_trade:
+                    last_price = float(all_ticks[-1]["p"])
+                    pnl_pct = ((last_price - entry_price) / entry_price) * 100
+                    trades.append({
+                        "symbol": symbol,
+                        "entry_date": datetime.fromtimestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S"),
+                        "exit_date": datetime.fromtimestamp(all_ticks[-1]["T"] / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+                        "entry_price": entry_price,
+                        "exit_price": round(last_price, 8),
+                        "pnl_pct": round(pnl_pct, 2),
+                        "pnl_usdt": round(amount * pnl_pct / 100, 2),
+                        "exit_reason": "OPEN",
+                        "entry_type": entry_type
+                    })
+            except Exception as e:
+                logger.debug(f"Tick backtest error for {symbol}: {e}")
+            return trades
+
+        all_trades = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(tick_backtest_symbol, s): s for s in symbols}
+            for future in as_completed(futures):
+                all_trades.extend(future.result())
+
+        all_trades.sort(key=lambda x: x["entry_date"])
+
+        if max_simultaneous_limit > 0 and all_trades:
+            filtered = []
+            open_trades = []
+            skipped = 0
+            for t in all_trades:
+                open_trades = [ot for ot in open_trades if ot["exit_date"] > t["entry_date"]]
+                if len(open_trades) >= max_simultaneous_limit:
+                    skipped += 1
+                    continue
+                filtered.append(t)
+                open_trades.append(t)
+            all_trades = filtered
+            trades_skipped = skipped
+        else:
+            trades_skipped = 0
+
+        max_simultaneous = 0
+        if all_trades:
+            events = []
+            for t in all_trades:
+                events.append((t["entry_date"], 1))
+                events.append((t.get("exit_date", t["entry_date"]), -1))
+            events.sort(key=lambda x: (x[0], x[1]))
+            current_open = 0
+            for _, delta in events:
+                current_open += delta
+                if current_open > max_simultaneous:
+                    max_simultaneous = current_open
+
+        durations = []
+        for t in all_trades:
+            if t.get("exit_date") and t.get("entry_date"):
+                try:
+                    d1 = _parse_dt(t["entry_date"])
+                    d2 = _parse_dt(t["exit_date"])
+                    durations.append((d2 - d1).total_seconds() / 3600)
+                except Exception:
+                    pass
+        avg_duration_hours = round(sum(durations) / len(durations), 1) if durations else 0
+
+        wins = [t for t in all_trades if t["pnl_pct"] > 0]
+        losses = [t for t in all_trades if t["pnl_pct"] <= 0]
+        total_pnl = sum(t["pnl_usdt"] for t in all_trades)
+        crash_trades = sum(1 for t in all_trades if t.get("entry_type") != "pump")
+        pump_trades = sum(1 for t in all_trades if t.get("entry_type") == "pump")
+
+        summary = {
+            "total_trades": len(all_trades),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": (len(wins) / len(all_trades) * 100) if all_trades else 0,
+            "total_pnl": round(total_pnl, 2),
+            "avg_win": round(sum(t["pnl_pct"] for t in wins) / len(wins), 2) if wins else 0,
+            "avg_loss": round(sum(t["pnl_pct"] for t in losses) / len(losses), 2) if losses else 0,
+            "best_trade": round(max(t["pnl_pct"] for t in all_trades), 2) if all_trades else 0,
+            "worst_trade": round(min(t["pnl_pct"] for t in all_trades), 2) if all_trades else 0,
+            "max_simultaneous": max_simultaneous,
+            "max_capital_needed": round(max_simultaneous * amount, 2),
+            "trades_skipped": trades_skipped,
+            "avg_duration_hours": avg_duration_hours,
+            "crash_trades": crash_trades,
+            "pump_trades": pump_trades
+        }
+
+        scan_time = round(tm.time() - scan_start, 1)
+        return jsonify({
+            "summary": summary,
+            "trades": all_trades[:200],
+            "coins_scanned": len(symbols),
+            "scan_time_seconds": scan_time
+        })
+
+    def _run_hybrid_backtest(req, rest_url, quote, start_ts, end_ts,
+                            crash_threshold, window_minutes, pump_threshold, pump_window_sec,
+                            take_profit, stop_loss, pump_tp, pump_sl,
+                            amount, top_n, max_simultaneous_limit,
+                            max_duration_hours=0):
+        """Hybrid backtest: same crash detection as candle mode, but 1-min precision for exits."""
+        from datetime import datetime
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time as tm
+
+        scan_start = tm.time()
+        interval_map = {5: "5m", 15: "15m", 60: "1h", 240: "4h", 1440: "1d"}
+        interval = interval_map.get(window_minutes, "15m")
+
+        resp = req.get(f"{rest_url}/api/v3/ticker/24hr", timeout=30)
+        tickers = resp.json()
+        usdt_pairs = [t for t in tickers if t["symbol"].endswith(quote) and float(t["quoteVolume"]) > 0]
+        usdt_pairs.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
+        symbols = [t["symbol"] for t in usdt_pairs[:top_n]]
+
+        def fetch_klines(symbol, intv, ts_start, ts_end, max_pages=15):
+            all_k = []
+            cur = ts_start
+            for _ in range(max_pages):
+                r = req.get(f"{rest_url}/api/v3/klines", params={
+                    "symbol": symbol, "interval": intv,
+                    "startTime": cur, "endTime": ts_end, "limit": 1000
+                }, timeout=15)
+                chunk = r.json()
+                if not chunk or not isinstance(chunk, list):
+                    break
+                all_k.extend(chunk)
+                if len(chunk) < 1000:
+                    break
+                cur = chunk[-1][0] + 1
+            return all_k
+
+        def hybrid_backtest_symbol(symbol):
+            trades = []
+            try:
+                klines = fetch_klines(symbol, interval, start_ts, end_ts)
+                if not klines:
+                    return trades
+
+                crash_candles = []
+                for i in range(len(klines)):
+                    high = float(klines[i][2])
+                    low = float(klines[i][3])
+                    if high == 0:
+                        continue
+                    drop = ((high - low) / high) * 100
+                    if drop >= crash_threshold:
+                        crash_candles.append({
+                            "ts": int(klines[i][0]),
+                            "high": high,
+                            "low": low,
+                            "entry_price": low,
+                            "entry_type": "crash"
+                        })
+
+                if not crash_candles:
+                    return trades
+
+                in_trade = False
+                entry_price = 0
+                entry_time = 0
+                entry_type = "crash"
+                crash_idx = 0
+
+                while crash_idx < len(crash_candles):
+                    cc = crash_candles[crash_idx]
+                    crash_idx += 1
+
+                    if in_trade:
+                        continue
+
+                    entry_price = cc["entry_price"]
+                    entry_time = cc["ts"] / 1000
+                    entry_type = cc["entry_type"]
+                    entry_date = datetime.fromtimestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S")
+                    in_trade = True
+
+                    tp = pump_tp if entry_type == "pump" else take_profit
+                    sl = pump_sl if entry_type == "pump" else stop_loss
+
+                    max_dur_ms = int(max_duration_hours * 3600 * 1000) if max_duration_hours > 0 else 86400000
+                    exit_search_end = cc["ts"] + max_dur_ms + 3600000
+
+                    exit_candles = fetch_klines(symbol, "1m", cc["ts"], min(exit_search_end, end_ts), max_pages=30)
+
+                    trade_closed = False
+                    for ec in exit_candles:
+                        ets = ec[0] / 1000
+                        ehigh = float(ec[2])
+                        elow = float(ec[3])
+                        eclose = float(ec[4])
+                        edate = datetime.fromtimestamp(ets).strftime("%Y-%m-%d %H:%M:%S")
+
+                        pnl_high = ((ehigh - entry_price) / entry_price) * 100
+                        pnl_low = ((elow - entry_price) / entry_price) * 100
+
+                        if pnl_high >= tp:
+                            exit_price = entry_price * (1 + tp / 100)
+                            trades.append({
+                                "symbol": symbol,
+                                "entry_date": entry_date,
+                                "exit_date": edate,
+                                "entry_price": entry_price,
+                                "exit_price": round(exit_price, 8),
+                                "pnl_pct": round(tp, 2),
+                                "pnl_usdt": round(amount * tp / 100, 2),
+                                "exit_reason": "TP",
+                                "entry_type": entry_type
+                            })
+                            trade_closed = True
+                            break
+                        elif pnl_low <= -sl:
+                            exit_price = entry_price * (1 - sl / 100)
+                            trades.append({
+                                "symbol": symbol,
+                                "entry_date": entry_date,
+                                "exit_date": edate,
+                                "entry_price": entry_price,
+                                "exit_price": round(exit_price, 8),
+                                "pnl_pct": round(-sl, 2),
+                                "pnl_usdt": round(-amount * sl / 100, 2),
+                                "exit_reason": "SL",
+                                "entry_type": entry_type
+                            })
+                            trade_closed = True
+                            break
+                        elif max_duration_hours > 0 and (ets - entry_time) >= max_duration_hours * 3600:
+                            pnl = ((eclose - entry_price) / entry_price) * 100
+                            trades.append({
+                                "symbol": symbol,
+                                "entry_date": entry_date,
+                                "exit_date": edate,
+                                "entry_price": entry_price,
+                                "exit_price": round(eclose, 8),
+                                "pnl_pct": round(pnl, 2),
+                                "pnl_usdt": round(amount * pnl / 100, 2),
+                                "exit_reason": "TIME",
+                                "entry_type": entry_type
+                            })
+                            trade_closed = True
+                            break
+
+                    if not trade_closed:
+                        if exit_candles:
+                            last = exit_candles[-1]
+                            last_close = float(last[4])
+                            last_ts = last[0] / 1000
+                            pnl = ((last_close - entry_price) / entry_price) * 100
+                            trades.append({
+                                "symbol": symbol,
+                                "entry_date": entry_date,
+                                "exit_date": datetime.fromtimestamp(last_ts).strftime("%Y-%m-%d %H:%M:%S"),
+                                "entry_price": entry_price,
+                                "exit_price": round(last_close, 8),
+                                "pnl_pct": round(pnl, 2),
+                                "pnl_usdt": round(amount * pnl / 100, 2),
+                                "exit_reason": "OPEN",
+                                "entry_type": entry_type
+                            })
+
+                    in_trade = False
+                    if trade_closed and crash_idx < len(crash_candles):
+                        exit_ts = trades[-1]["exit_date"] if trades else ""
+                        while crash_idx < len(crash_candles):
+                            next_crash_date = datetime.fromtimestamp(crash_candles[crash_idx]["ts"] / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                            if next_crash_date > exit_ts:
+                                break
+                            crash_idx += 1
+
+            except Exception as e:
+                logger.debug(f"Hybrid backtest error for {symbol}: {e}")
+            return trades
+
+        all_trades = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(hybrid_backtest_symbol, s): s for s in symbols}
+            for future in as_completed(futures):
+                all_trades.extend(future.result())
+
+        all_trades.sort(key=lambda x: x["entry_date"])
+
+        if max_simultaneous_limit > 0 and all_trades:
+            filtered = []
+            open_t = []
+            skipped = 0
+            for t in all_trades:
+                open_t = [ot for ot in open_t if ot["exit_date"] > t["entry_date"]]
+                if len(open_t) >= max_simultaneous_limit:
+                    skipped += 1
+                    continue
+                filtered.append(t)
+                open_t.append(t)
+            all_trades = filtered
+            trades_skipped = skipped
+        else:
+            trades_skipped = 0
+
+        max_simultaneous = 0
+        if all_trades:
+            events = []
+            for t in all_trades:
+                events.append((t["entry_date"], 1))
+                events.append((t.get("exit_date", t["entry_date"]), -1))
+            events.sort(key=lambda x: (x[0], x[1]))
+            current_open = 0
+            for _, delta in events:
+                current_open += delta
+                if current_open > max_simultaneous:
+                    max_simultaneous = current_open
+
+        durations = []
+        for t in all_trades:
+            if t.get("exit_date") and t.get("entry_date"):
+                try:
+                    d1 = _parse_dt(t["entry_date"])
+                    d2 = _parse_dt(t["exit_date"])
+                    durations.append((d2 - d1).total_seconds() / 3600)
+                except Exception:
+                    pass
+        avg_duration_hours = round(sum(durations) / len(durations), 1) if durations else 0
+
+        wins = [t for t in all_trades if t["pnl_pct"] > 0]
+        losses = [t for t in all_trades if t["pnl_pct"] <= 0]
+        total_pnl = sum(t["pnl_usdt"] for t in all_trades)
+        crash_trades = sum(1 for t in all_trades if t.get("entry_type") != "pump")
+        pump_trades = sum(1 for t in all_trades if t.get("entry_type") == "pump")
+
+        summary = {
+            "total_trades": len(all_trades),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": (len(wins) / len(all_trades) * 100) if all_trades else 0,
+            "total_pnl": round(total_pnl, 2),
+            "avg_win": round(sum(t["pnl_pct"] for t in wins) / len(wins), 2) if wins else 0,
+            "avg_loss": round(sum(t["pnl_pct"] for t in losses) / len(losses), 2) if losses else 0,
+            "best_trade": round(max(t["pnl_pct"] for t in all_trades), 2) if all_trades else 0,
+            "worst_trade": round(min(t["pnl_pct"] for t in all_trades), 2) if all_trades else 0,
+            "max_simultaneous": max_simultaneous,
+            "max_capital_needed": round(max_simultaneous * amount, 2),
+            "trades_skipped": trades_skipped,
+            "avg_duration_hours": avg_duration_hours,
+            "crash_trades": crash_trades,
+            "pump_trades": pump_trades
+        }
+
+        scan_time = round(tm.time() - scan_start, 1)
+        return jsonify({
+            "summary": summary,
+            "trades": all_trades[:200],
+            "coins_scanned": len(symbols),
+            "scan_time_seconds": scan_time
+        })
+
+    def _get_book_price(symbol, quantity):
+        """Get realistic exit price by simulating sell through order book."""
+        import requests as req
+        rest = config.get("binance", {}).get("rest_url", "https://api.binance.com")
+        try:
+            ob = req.get(f"{rest}/api/v3/depth", params={"symbol": symbol, "limit": 50}, timeout=5).json()
+            bids = ob.get("bids", [])
+            if not bids:
+                raise ValueError("No bids")
+            remaining = quantity
+            total_quote = 0.0
+            for ps, qs in bids:
+                px, qx = float(ps), float(qs)
+                fill = min(remaining, qx)
+                total_quote += fill * px
+                remaining -= fill
+                if remaining <= 0:
+                    break
+            if remaining > 0:
+                total_quote += remaining * float(bids[-1][0])
+            fill_avg = total_quote / quantity if quantity > 0 else float(bids[0][0])
+            return round(fill_avg, 10)
+        except Exception:
+            try:
+                r = req.get(f"{rest}/api/v3/ticker/price", params={"symbol": symbol}, timeout=5)
+                return float(r.json()["price"])
+            except Exception:
+                return None
+
+    @app.route("/api/close-selected", methods=["POST"])
+    def close_selected_positions():
+        """Close selected positions - live sell via Convert API or book price."""
+        try:
+            data = request.get_json()
+            ids = data.get("ids", [])
+            if not ids:
+                return jsonify({"success": False, "error": "No positions selected"})
+            open_trades = database.get_open_trades()
+            closed = 0
+            failed = 0
+            for trade in open_trades:
+                if trade["id"] in ids:
+                    if trader.live_mode and trade.get("is_live"):
+                        result = trader.market_sell(trade["symbol"], trade["quantity"], trade_method=trade.get("trade_method"))
+                        if not result:
+                            logger.error(f"LIVE SELL FAILED: {trade['symbol']} #{trade['id']} - position kept open")
+                            failed += 1
+                            continue
+                        price = result["avg_price"]
+                        logger.info(f"LIVE CLOSE SELECTED: {trade['symbol']} #{trade['id']} sold -> {result.get('eur_received', 0):.2f} EUR")
+                    else:
+                        price = _get_book_price(trade["symbol"], trade["quantity"])
+                        if price is None:
+                            price = trade.get("current_price") or trade["entry_price"]
+                        logger.info(f"CLOSE SELECTED (book): {trade['symbol']} #{trade['id']} at {price:.8g}")
+                    database.close_trade(trade["id"], price, "M")
+                    closed += 1
+            resp = {"success": True, "closed": closed}
+            if failed:
+                resp["failed"] = failed
+                resp["error"] = f"{failed} sell(s) failed on Binance - those positions kept open"
+            return jsonify(resp)
+        except Exception as e:
+            logger.error(f"Close selected error: {e}")
+            return jsonify({"success": False, "error": str(e)})
+
+    @app.route("/api/close-position/<int:trade_id>", methods=["POST"])
+    def close_position(trade_id):
+        """Close a single position - live sell via Convert API or book price."""
+        try:
+            trades = database.get_open_trades()
+            trade = next((t for t in trades if t["id"] == trade_id), None)
+            if not trade:
+                return jsonify({"success": False, "error": "Trade not found"})
+            if trader.live_mode and trade.get("is_live"):
+                result = trader.market_sell(trade["symbol"], trade["quantity"], trade_method=trade.get("trade_method"))
+                if not result:
+                    return jsonify({"success": False, "error": "Binance sell failed - position kept open"})
+                price = result["avg_price"]
+                logger.info(f"LIVE CLOSE: {trade['symbol']} #{trade_id} sold -> {result.get('eur_received', 0):.2f} EUR")
+            else:
+                price = _get_book_price(trade["symbol"], trade["quantity"])
+                if price is None:
+                    price = trade.get("current_price") or trade["entry_price"]
+                logger.info(f"MANUAL CLOSE (book): {trade['symbol']} #{trade_id} at {price:.8g}")
+            database.close_trade(trade_id, price, "M")
+            return jsonify({"success": True})
+        except Exception as e:
+            logger.error(f"Close position error: {e}")
+            return jsonify({"success": False, "error": str(e)})
+
+    @app.route("/api/remove-position/<int:trade_id>", methods=["POST"])
+    def remove_position(trade_id):
+        """Remove position from tracker without selling on Binance."""
+        try:
+            trades = database.get_open_trades()
+            trade = next((t for t in trades if t["id"] == trade_id), None)
+            if not trade:
+                return jsonify({"success": False, "error": "Trade not found"})
+            database.close_trade(trade_id, trade["entry_price"], "M")
+            logger.info(f"REMOVED (no sell): {trade['symbol']} #{trade_id}")
+            return jsonify({"success": True})
+        except Exception as e:
+            logger.error(f"Remove position error: {e}")
+            return jsonify({"success": False, "error": str(e)})
+
+
+    @app.route("/api/trade-tpsl/<int:trade_id>", methods=["POST"])
+    def update_trade_tpsl(trade_id):
+        """Update individual TP/SL for a specific trade."""
+        data = request.get_json()
+        tp_pct = float(data.get("tp_pct", 0))
+        sl_pct = float(data.get("sl_pct", 0))
+        active = int(data.get("active", 0))
+        database.update_trade_tpsl(trade_id, tp_pct, sl_pct, active)
+        return jsonify({"status": "ok"})
+
+    @app.route("/api/close-all", methods=["POST"])
+    def close_all_positions():
+        """Close all open positions - live sell via Convert API or book price."""
+        try:
+            open_trades = database.get_open_trades()
+            if not open_trades:
+                return jsonify({"success": True, "closed": 0, "message": "No open positions"})
+            closed = 0
+            failed = 0
+            for trade in open_trades:
+                if trader.live_mode and trade.get("is_live"):
+                    result = trader.market_sell(trade["symbol"], trade["quantity"], trade_method=trade.get("trade_method"))
+                    if not result:
+                        logger.error(f"LIVE SELL FAILED: {trade['symbol']} #{trade['id']} - position kept open")
+                        failed += 1
+                        continue
+                    price = result["avg_price"]
+                    logger.info(f"LIVE CLOSE ALL: {trade['symbol']} #{trade['id']} sold -> {result.get('eur_received', 0):.2f} EUR")
+                else:
+                    price = _get_book_price(trade["symbol"], trade["quantity"])
+                    if price is None:
+                        price = trade.get("current_price") or trade["entry_price"]
+                    logger.info(f"CLOSE ALL (book): {trade['symbol']} closed at {price:.8g}")
+                database.close_trade(trade["id"], price, "M")
+                closed += 1
+            resp = {"success": True, "closed": closed}
+            if failed:
+                resp["failed"] = failed
+                resp["error"] = f"{failed} sell(s) failed on Binance - those positions kept open"
+            return jsonify(resp)
+        except Exception as e:
+            logger.error(f"Close all error: {e}")
+            return jsonify({"success": False, "error": str(e)})
+
+    @app.route("/api/reset-history", methods=["POST"])
+    def reset_history():
+        """Clear closed trade history only (reset realized P&L). Open positions are kept."""
+        try:
+            conn = database._get_conn()
+            with database._lock:
+                count = conn.execute("SELECT COUNT(*) FROM trades WHERE status='CLOSED'").fetchone()[0]
+                conn.execute("DELETE FROM trades WHERE status='CLOSED'")
+                conn.commit()
+            logger.info(f"RESET P&L: Cleared {count} closed trades (open positions kept)")
+            return jsonify({"success": True, "deleted": count})
+        except Exception as e:
+            logger.error(f"Reset history error: {e}")
+            return jsonify({"success": False, "error": str(e)})
+
+    @app.route("/api/conditional-close/sel", methods=["POST"])
+    def set_conditional_sel():
+        try:
+            data = request.get_json()
+            ids = data.get("ids", [])
+            if not ids:
+                return jsonify({"success": False, "error": "No positions selected"})
+            cond_sel["active"] = True
+            cond_sel["ids"] = ids
+            cond_sel["tp_usdt"] = data.get("tp_usdt")
+            cond_sel["tp_book"] = data.get("tp_book")
+            cond_sel["sl_usdt"] = data.get("sl_usdt")
+            cond_sel["sl_book"] = data.get("sl_book")
+            cond_sel["triggered"] = None
+            logger.info(f"COND SEL SET: {len(ids)} pos, TP={data.get('tp_usdt')}, TPB={data.get('tp_book')}, SL={data.get('sl_usdt')}, SLB={data.get('sl_book')}")
+            _save_cond()
+            return jsonify({"success": True, "count": len(ids)})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)})
+
+    @app.route("/api/conditional-close/sel", methods=["DELETE"])
+    def clear_conditional_sel():
+        cond_sel.update({"active": False, "ids": [], "tp_usdt": None, "tp_book": None, "sl_usdt": None, "sl_book": None, "triggered": None})
+        logger.info("COND SEL CLEARED")
+        _save_cond()
+        return jsonify({"success": True})
+
+    @app.route("/api/conditional-close/all", methods=["POST"])
+    def set_conditional_all():
+        try:
+            data = request.get_json()
+            cond_all["active"] = True
+            cond_all["tp_usdt"] = data.get("tp_usdt")
+            cond_all["tp_book"] = data.get("tp_book")
+            cond_all["sl_usdt"] = data.get("sl_usdt")
+            cond_all["sl_book"] = data.get("sl_book")
+            cond_all["triggered"] = None
+            logger.info(f"COND ALL SET: TP={data.get('tp_usdt')}, TPB={data.get('tp_book')}, SL={data.get('sl_usdt')}, SLB={data.get('sl_book')}")
+            _save_cond()
+            return jsonify({"success": True})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)})
+
+    @app.route("/api/conditional-close/all", methods=["DELETE"])
+    def clear_conditional_all():
+        cond_all.update({"active": False, "tp_usdt": None, "tp_book": None, "sl_usdt": None, "sl_book": None, "triggered": None})
+        logger.info("COND ALL CLEARED")
+        _save_cond()
+        return jsonify({"success": True})
+
+    @app.route("/api/conditional-close/status", methods=["GET"])
+    def get_conditional_status():
+        return jsonify({
+            "sel": {"active": cond_sel["active"], "ids": cond_sel.get("ids", []), "count": len(cond_sel.get("ids", [])),
+                    "tp_usdt": cond_sel["tp_usdt"], "tp_book": cond_sel["tp_book"], "sl_usdt": cond_sel["sl_usdt"], "sl_book": cond_sel["sl_book"]},
+            "all": {"active": cond_all["active"],
+                    "tp_usdt": cond_all["tp_usdt"], "tp_book": cond_all["tp_book"], "sl_usdt": cond_all["sl_usdt"], "sl_book": cond_all["sl_book"]}
+        })
+
+    @app.route("/api/backtest/refine", methods=["POST"])
+    def backtest_refine():
+        """Refine backtest trades with tick-by-tick data from Binance aggTrades."""
+        import requests as req
+        from datetime import datetime
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time as tm
+
+        try:
+            data = request.get_json()
+            input_trades = data.get("trades", [])
+            take_profit = float(data.get("take_profit", 50))
+            stop_loss = float(data.get("stop_loss", 20))
+            pump_tp = float(data.get("pump_tp", take_profit))
+            pump_sl = float(data.get("pump_sl", stop_loss))
+            amount = float(data.get("amount", 1000))
+            max_duration_hours = float(data.get("max_duration_hours", 0))
+            max_simultaneous_limit = int(data.get("max_simultaneous", 10))
+            window_minutes = int(data.get("window_minutes", 60))
+            crash_threshold = float(data.get("threshold", 30))
+            window_sec = window_minutes * 60
+
+            rest_url = config.get("binance", {}).get("rest_url", "https://api.binance.com")
+            scan_start = tm.time()
+
+            trade_entries = []
+            for t in input_trades:
+                trade_entries.append({
+                    "symbol": t["symbol"],
+                    "entry_date": t["entry_date"],
+                    "entry_price": t["entry_price"],
+                    "entry_type": t.get("entry_type", "crash"),
+                    "entry_ts": int(_parse_dt(t["entry_date"]).timestamp() * 1000)
+                })
+
+            def refine_trade(te):
+                try:
+                    symbol = te["symbol"]
+                    entry_ts = te["entry_ts"]
+                    entry_type = te["entry_type"]
+                    tp = pump_tp if entry_type == "pump" else take_profit
+                    sl = pump_sl if entry_type == "pump" else stop_loss
+
+                    tick_start = entry_ts - window_sec * 1000
+                    max_dur_ms = int(max_duration_hours * 3600 * 1000) if max_duration_hours > 0 else 86400000
+                    tick_end = entry_ts + max_dur_ms + 3600000
+
+                    price_window = deque()
+                    in_trade = False
+                    entry_price = 0
+                    entry_time = 0
+                    last_tick = None
+                    got_any = False
+
+                    cur_ts = tick_start
+                    trade_deadline = tm.time() + 30
+                    for _ in range(100):
+                        if tm.time() > trade_deadline:
+                            break
+                        r = req.get(f"{rest_url}/api/v3/aggTrades", params={
+                            "symbol": symbol, "startTime": cur_ts, "endTime": tick_end, "limit": 1000
+                        }, timeout=10)
+                        chunk = r.json()
+                        if not chunk or not isinstance(chunk, list):
+                            break
+                        got_any = True
+                        chunk.sort(key=lambda x: x["T"])
+                        for tick in chunk:
+                            last_tick = tick
+                            ts = tick["T"] / 1000
+                            price = float(tick["p"])
+                            price_window.append((ts, price))
+                            cutoff = ts - window_sec
+                            while price_window and price_window[0][0] < cutoff:
+                                price_window.popleft()
+                            if in_trade:
+                                pnl = ((price - entry_price) / entry_price) * 100
+                                if pnl >= tp:
+                                    exit_price = entry_price * (1 + tp / 100)
+                                    return {
+                                        "symbol": symbol,
+                                        "entry_date": datetime.fromtimestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S"),
+                                        "exit_date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                                        "entry_price": entry_price,
+                                        "exit_price": round(exit_price, 8),
+                                        "pnl_pct": round(tp, 2),
+                                        "pnl_usdt": round(amount * tp / 100, 2),
+                                        "exit_reason": "TP",
+                                        "entry_type": entry_type
+                                    }
+                                elif pnl <= -sl:
+                                    exit_price = entry_price * (1 - sl / 100)
+                                    return {
+                                        "symbol": symbol,
+                                        "entry_date": datetime.fromtimestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S"),
+                                        "exit_date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                                        "entry_price": entry_price,
+                                        "exit_price": round(exit_price, 8),
+                                        "pnl_pct": round(-sl, 2),
+                                        "pnl_usdt": round(-amount * sl / 100, 2),
+                                        "exit_reason": "SL",
+                                        "entry_type": entry_type
+                                    }
+                                elif max_duration_hours > 0 and (ts - entry_time) >= max_duration_hours * 3600:
+                                    return {
+                                        "symbol": symbol,
+                                        "entry_date": datetime.fromtimestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S"),
+                                        "exit_date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                                        "entry_price": entry_price,
+                                        "exit_price": round(price, 8),
+                                        "pnl_pct": round(pnl, 2),
+                                        "pnl_usdt": round(amount * pnl / 100, 2),
+                                        "exit_reason": "TIME",
+                                        "entry_type": entry_type
+                                    }
+                            else:
+                                if tick["T"] < entry_ts:
+                                    continue
+                                max_price = max((p for t2, p in price_window if t2 >= cutoff), default=0)
+                                if max_price > 0:
+                                    drop = ((max_price - price) / max_price) * 100
+                                    if drop >= crash_threshold:
+                                        in_trade = True
+                                        entry_price = price
+                                        entry_time = ts
+                        if len(chunk) < 1000:
+                            break
+                        cur_ts = chunk[-1]["T"] + 1
+                        tm.sleep(0.05)
+
+                    if not got_any:
+                        return te
+
+                    if in_trade and last_tick:
+                        last_price = float(last_tick["p"])
+                        last_ts = last_tick["T"] / 1000
+                        pnl = ((last_price - entry_price) / entry_price) * 100
+                        return {
+                            "symbol": symbol,
+                            "entry_date": datetime.fromtimestamp(entry_time).strftime("%Y-%m-%d %H:%M:%S"),
+                            "exit_date": datetime.fromtimestamp(last_ts).strftime("%Y-%m-%d %H:%M:%S"),
+                            "entry_price": entry_price,
+                            "exit_price": round(last_price, 8),
+                            "pnl_pct": round(pnl, 2),
+                            "pnl_usdt": round(amount * pnl / 100, 2),
+                            "exit_reason": "OPEN",
+                            "entry_type": entry_type
+                        }
+                    return None
+                except Exception as e:
+                    logger.debug(f"Refine error for {te['symbol']}: {e}")
+                    return None
+            all_trades = []
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {executor.submit(refine_trade, te): te for te in trade_entries}
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result:
+                        all_trades.append(result)
+
+            all_trades.sort(key=lambda x: x["entry_date"])
+
+            if max_simultaneous_limit > 0 and all_trades:
+                filtered = []
+                open_t = []
+                skipped = 0
+                for t in all_trades:
+                    open_t = [ot for ot in open_t if ot["exit_date"] > t["entry_date"]]
+                    if len(open_t) >= max_simultaneous_limit:
+                        skipped += 1
+                        continue
+                    filtered.append(t)
+                    open_t.append(t)
+                all_trades = filtered
+                trades_skipped = skipped
+            else:
+                trades_skipped = 0
+
+            max_simultaneous = 0
+            if all_trades:
+                events = []
+                for t in all_trades:
+                    events.append((t["entry_date"], 1))
+                    events.append((t.get("exit_date", t["entry_date"]), -1))
+                events.sort(key=lambda x: (x[0], x[1]))
+                current_open = 0
+                for _, delta in events:
+                    current_open += delta
+                    if current_open > max_simultaneous:
+                        max_simultaneous = current_open
+
+            durations = []
+            for t in all_trades:
+                if t.get("exit_date") and t.get("entry_date"):
+                    try:
+                        d1 = _parse_dt(t["entry_date"])
+                        d2 = _parse_dt(t["exit_date"])
+                        durations.append((d2 - d1).total_seconds() / 3600)
+                    except Exception:
+                        pass
+            avg_duration_hours = round(sum(durations) / len(durations), 1) if durations else 0
+
+            wins = [t for t in all_trades if t["pnl_pct"] > 0]
+            losses = [t for t in all_trades if t["pnl_pct"] <= 0]
+            total_pnl = sum(t["pnl_usdt"] for t in all_trades)
+            crash_trades = sum(1 for t in all_trades if t.get("entry_type") != "pump")
+            pump_trades = sum(1 for t in all_trades if t.get("entry_type") == "pump")
+
+            summary = {
+                "total_trades": len(all_trades),
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": (len(wins) / len(all_trades) * 100) if all_trades else 0,
+                "total_pnl": round(total_pnl, 2),
+                "avg_win": round(sum(t["pnl_pct"] for t in wins) / len(wins), 2) if wins else 0,
+                "avg_loss": round(sum(t["pnl_pct"] for t in losses) / len(losses), 2) if losses else 0,
+                "best_trade": round(max(t["pnl_pct"] for t in all_trades), 2) if all_trades else 0,
+                "worst_trade": round(min(t["pnl_pct"] for t in all_trades), 2) if all_trades else 0,
+                "max_simultaneous": max_simultaneous,
+                "max_capital_needed": round(max_simultaneous * amount, 2),
+                "trades_skipped": trades_skipped,
+                "avg_duration_hours": avg_duration_hours,
+                "crash_trades": crash_trades,
+                "pump_trades": pump_trades
+            }
+
+            scan_time = round(tm.time() - scan_start, 1)
+            return jsonify({
+                "summary": summary,
+                "trades": all_trades[:200],
+                "scan_time_seconds": scan_time
+            })
+
+        except Exception as e:
+            logger.error(f"Refine error: {e}")
+            return jsonify({"error": str(e)})
+
+    @app.route("/api/backtest", methods=["POST"])
+    def backtest():
+        """Run a strategy backtest on historical data."""
+        import requests as req
+        from datetime import datetime
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        try:
+            data = request.get_json()
+            date_from = data.get("date_from")
+            date_to = data.get("date_to")
+            threshold = float(data.get("threshold", 30))
+            window_minutes = int(data.get("window_minutes", 15))
+            take_profit = float(data.get("take_profit", 50))
+            stop_loss = float(data.get("stop_loss", 20))
+            amount = float(data.get("amount", 1000))
+            top_n = min(int(data.get("top_n", 100)), 500)
+            max_simultaneous_limit = int(data.get("max_simultaneous", 10))
+
+            use_double_bottom = bool(data.get("double_bottom", False))
+            bt_mode = data.get("mode", "candle")
+            pump_enabled = bool(data.get("pump_enabled", False))
+            pump_threshold = float(data.get("pump_threshold", 5)) if pump_enabled else 99999
+            pump_window_sec = int(data.get("pump_window_seconds", 5))
+            pump_tp = float(data.get("pump_tp", take_profit))
+            pump_sl = float(data.get("pump_sl", stop_loss))
+            coin_range_start = int(data.get("coin_range_start", 0))
+            max_duration_hours = float(data.get("max_duration_hours", 0))
+
+            start_ts = int(datetime.strptime(date_from, "%Y-%m-%d").timestamp() * 1000)
+            end_ts = int(datetime.strptime(date_to + " 23:59:59", "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+
+            rest_url = config.get("binance", {}).get("rest_url", "https://api.binance.com")
+            quote = config.get("binance", {}).get("quote_asset", "USDT")
+
+            if bt_mode == "tick":
+                top_n = min(top_n, 20)
+                return _run_tick_backtest(
+                    req, rest_url, quote, start_ts, end_ts,
+                    threshold, window_minutes, pump_threshold, pump_window_sec,
+                    take_profit, stop_loss, pump_tp, pump_sl,
+                    amount, top_n, max_simultaneous_limit, coin_range_start,
+                    max_duration_hours
+                )
+
+            if bt_mode == "hybrid":
+                return _run_hybrid_backtest(
+                    req, rest_url, quote, start_ts, end_ts,
+                    threshold, window_minutes, pump_threshold, pump_window_sec,
+                    take_profit, stop_loss, pump_tp, pump_sl,
+                    amount, top_n, max_simultaneous_limit,
+                    max_duration_hours
+                )
+
+            interval_map = {5: "5m", 15: "15m", 60: "1h", 240: "4h", 1440: "1d"}
+            interval = interval_map.get(window_minutes, "15m")
+
+            scan_start = time.time()
+
+            resp = req.get(f"{rest_url}/api/v3/ticker/24hr", timeout=30)
+            tickers = resp.json()
+            usdt_pairs = [t for t in tickers if t["symbol"].endswith(quote) and float(t["quoteVolume"]) > 0]
+            usdt_pairs.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
+            symbols = [t["symbol"] for t in usdt_pairs[:top_n]]
+
+            def fetch_klines_paginated(symbol, intv, ts_start, ts_end, max_pages=15):
+                all_klines = []
+                cur = ts_start
+                for _ in range(max_pages):
+                    r = req.get(f"{rest_url}/api/v3/klines", params={
+                        "symbol": symbol, "interval": intv,
+                        "startTime": cur, "endTime": ts_end, "limit": 1000
+                    }, timeout=15)
+                    chunk = r.json()
+                    if not chunk or not isinstance(chunk, list):
+                        break
+                    all_klines.extend(chunk)
+                    if len(chunk) < 1000:
+                        break
+                    cur = chunk[-1][0] + 1
+                return all_klines
+
+            def backtest_symbol(symbol):
+                trades = []
+                try:
+                    klines = fetch_klines_paginated(symbol, interval, start_ts, end_ts)
+                    if not klines:
+                        return trades
+
+                    daily_lows = []
+                    if use_double_bottom:
+                        try:
+                            lookback_start = start_ts - 120 * 86400 * 1000
+                            dk = fetch_klines_paginated(symbol, "1d", lookback_start, end_ts, max_pages=3)
+                            if dk:
+                                pd_list = [(float(k[3]), k[0] / 1000) for k in dk]
+                                for idx in range(1, len(pd_list) - 1):
+                                    if pd_list[idx][0] <= pd_list[idx-1][0] and pd_list[idx][0] <= pd_list[idx+1][0]:
+                                        daily_lows.append(pd_list[idx])
+                                if pd_list:
+                                    abs_min = min(pd_list, key=lambda x: x[0])
+                                    if abs_min not in daily_lows:
+                                        daily_lows.append(abs_min)
+                        except Exception:
+                            pass
+
+                    in_trade = False
+                    entry_price = 0
+                    entry_date = ""
+                    entry_ts = 0
+                    entry_type = "crash"
+
+                    for i in range(len(klines)):
+                        high = float(klines[i][2])
+                        low = float(klines[i][3])
+                        close = float(klines[i][4])
+                        candle_ts = int(klines[i][0]) / 1000
+
+                        if in_trade:
+                            tp = pump_tp if entry_type == "pump" else take_profit
+                            sl = pump_sl if entry_type == "pump" else stop_loss
+                            pnl_high = ((high - entry_price) / entry_price) * 100
+                            pnl_low = ((low - entry_price) / entry_price) * 100
+                            pnl_close = ((close - entry_price) / entry_price) * 100
+                            candle_date = datetime.fromtimestamp(candle_ts).strftime("%Y-%m-%d %H:%M")
+
+                            if pnl_high >= tp:
+                                exit_price = entry_price * (1 + tp / 100)
+                                pnl_usdt = amount * tp / 100
+                                trades.append({
+                                    "symbol": symbol,
+                                    "entry_date": entry_date,
+                                    "exit_date": candle_date,
+                                    "entry_price": entry_price,
+                                    "exit_price": round(exit_price, 8),
+                                    "pnl_pct": round(tp, 2),
+                                    "pnl_usdt": round(pnl_usdt, 2),
+                                    "exit_reason": "TP",
+                                    "entry_type": entry_type
+                                })
+                                in_trade = False
+                            elif pnl_low <= -sl:
+                                exit_price = entry_price * (1 - sl / 100)
+                                pnl_usdt = -amount * sl / 100
+                                trades.append({
+                                    "symbol": symbol,
+                                    "entry_date": entry_date,
+                                    "exit_date": candle_date,
+                                    "entry_price": entry_price,
+                                    "exit_price": round(exit_price, 8),
+                                    "pnl_pct": round(-sl, 2),
+                                    "pnl_usdt": round(pnl_usdt, 2),
+                                    "exit_reason": "SL",
+                                    "entry_type": entry_type
+                                })
+                                in_trade = False
+                            elif max_duration_hours > 0 and (candle_ts - entry_ts) >= max_duration_hours * 3600:
+                                pnl_usdt = amount * pnl_close / 100
+                                trades.append({
+                                    "symbol": symbol,
+                                    "entry_date": entry_date,
+                                    "exit_date": candle_date,
+                                    "entry_price": entry_price,
+                                    "exit_price": round(close, 8),
+                                    "pnl_pct": round(pnl_close, 2),
+                                    "pnl_usdt": round(pnl_usdt, 2),
+                                    "exit_reason": "TIME",
+                                    "entry_type": entry_type
+                                })
+                                in_trade = False
+                        else:
+                            if high == 0:
+                                continue
+                            drop = ((high - low) / high) * 100
+                            if drop >= threshold:
+                                if use_double_bottom and daily_lows:
+                                    candle_ts = int(klines[i][0]) / 1000
+                                    is_db = False
+                                    for low_price, low_ts in daily_lows:
+                                        if low_ts >= candle_ts - 3 * 86400:
+                                            continue
+                                        diff_pct = abs(low - low_price) / low_price * 100
+                                        if diff_pct <= 3.0:
+                                            is_db = True
+                                            break
+                                    if not is_db:
+                                        continue
+
+                                in_trade = True
+                                entry_price = low
+                                entry_ts = candle_ts
+                                entry_type = "crash"
+                                entry_date = datetime.fromtimestamp(candle_ts).strftime("%Y-%m-%d %H:%M")
+
+                    if in_trade:
+                        last_close = float(klines[-1][4])
+                        pnl_pct = ((last_close - entry_price) / entry_price) * 100
+                        pnl_usdt = amount * pnl_pct / 100
+                        last_date = datetime.fromtimestamp(int(klines[-1][0]) / 1000).strftime("%Y-%m-%d %H:%M")
+                        trades.append({
+                            "symbol": symbol,
+                            "entry_date": entry_date,
+                            "exit_date": last_date,
+                            "entry_price": entry_price,
+                            "exit_price": round(last_close, 8),
+                            "pnl_pct": round(pnl_pct, 2),
+                            "pnl_usdt": round(pnl_usdt, 2),
+                            "exit_reason": "OPEN",
+                            "entry_type": entry_type
+                        })
+                except Exception:
+                    pass
+                return trades
+
+            all_trades = []
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                futures = {executor.submit(backtest_symbol, s): s for s in symbols}
+                for future in as_completed(futures):
+                    all_trades.extend(future.result())
+
+            all_trades.sort(key=lambda x: x["entry_date"])
+
+            if max_simultaneous_limit > 0 and all_trades:
+                filtered = []
+                open_trades = []
+                skipped = 0
+                for t in all_trades:
+                    open_trades = [ot for ot in open_trades if ot["exit_date"] > t["entry_date"]]
+                    if len(open_trades) >= max_simultaneous_limit:
+                        skipped += 1
+                        continue
+                    filtered.append(t)
+                    open_trades.append(t)
+                all_trades = filtered
+                trades_skipped = skipped
+            else:
+                trades_skipped = 0
+
+            max_simultaneous = 0
+            if all_trades:
+                events = []
+                for t in all_trades:
+                    events.append((t["entry_date"], 1))
+                    events.append((t.get("exit_date", t["entry_date"]), -1))
+                events.sort(key=lambda x: (x[0], x[1]))
+                current_open = 0
+                for _, delta in events:
+                    current_open += delta
+                    if current_open > max_simultaneous:
+                        max_simultaneous = current_open
+
+            durations = []
+            for t in all_trades:
+                if t.get("exit_date") and t.get("entry_date"):
+                    try:
+                        d1 = _parse_dt(t["entry_date"])
+                        d2 = _parse_dt(t["exit_date"])
+                        durations.append((d2 - d1).total_seconds() / 3600)
+                    except Exception:
+                        pass
+            avg_duration_hours = round(sum(durations) / len(durations), 1) if durations else 0
+
+            wins = [t for t in all_trades if t["pnl_pct"] > 0]
+            losses = [t for t in all_trades if t["pnl_pct"] <= 0]
+            total_pnl = sum(t["pnl_usdt"] for t in all_trades)
+            crash_trades = sum(1 for t in all_trades if t.get("entry_type") != "pump")
+            pump_trades = sum(1 for t in all_trades if t.get("entry_type") == "pump")
+
+            summary = {
+                "total_trades": len(all_trades),
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": (len(wins) / len(all_trades) * 100) if all_trades else 0,
+                "total_pnl": round(total_pnl, 2),
+                "avg_win": round(sum(t["pnl_pct"] for t in wins) / len(wins), 2) if wins else 0,
+                "avg_loss": round(sum(t["pnl_pct"] for t in losses) / len(losses), 2) if losses else 0,
+                "best_trade": round(max(t["pnl_pct"] for t in all_trades), 2) if all_trades else 0,
+                "worst_trade": round(min(t["pnl_pct"] for t in all_trades), 2) if all_trades else 0,
+                "max_simultaneous": max_simultaneous,
+                "max_capital_needed": round(max_simultaneous * amount, 2),
+                "trades_skipped": trades_skipped,
+                "avg_duration_hours": avg_duration_hours,
+                "crash_trades": crash_trades,
+                "pump_trades": pump_trades
+            }
+
+            scan_time = round(time.time() - scan_start, 1)
+
+            return jsonify({
+                "summary": summary,
+                "trades": all_trades[:200],
+                "coins_scanned": len(symbols),
+                "scan_time_seconds": scan_time
+            })
+
+        except Exception as e:
+            logger.error(f"Backtest error: {e}")
+            return jsonify({"error": str(e)})
+
+    @app.route("/api/settings", methods=["GET"])
+    def get_settings():
+        """Get current settings."""
+        return jsonify({
+            "drop_threshold_percent": detection_cfg.get("drop_threshold_percent", 30),
+            "time_windows_minutes": detection_cfg.get("time_windows_minutes", [7, 15]),
+            "amount_per_trade_eur": trading_cfg.get("amount_per_trade_eur", 1000),
+            "take_profit_percent": trading_cfg.get("take_profit_percent", 50),
+            "stop_loss_percent": trading_cfg.get("stop_loss_percent", 20),
+            "mode": trading_cfg.get("mode", "demo")
+        })
+
+    @app.route("/api/settings", methods=["POST"])
+    def save_settings():
+        """Update settings live and save to config.json."""
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({"success": False, "error": "No data received"})
+
+            if "drop_threshold_percent" in data:
+                val = float(data["drop_threshold_percent"])
+                detection_cfg["drop_threshold_percent"] = val
+                if detector_ref:
+                    detector_ref[0].drop_threshold = val
+
+            if "time_windows_minutes" in data:
+                val = data["time_windows_minutes"]
+                detection_cfg["time_windows_minutes"] = val
+                if detector_ref:
+                    detector_ref[0].time_windows = val
+                    detector_ref[0].max_window_seconds = max(val) * 60 + 60
+
+            if "amount_per_trade_eur" in data:
+                val = float(data["amount_per_trade_eur"])
+                trading_cfg["amount_per_trade_eur"] = val
+                if detector_ref:
+                    detector_ref[0].trade_amount = val
+
+            if "amount_per_trade_usdc" in data:
+                val = float(data["amount_per_trade_usdc"])
+                trading_cfg["amount_per_trade_usdc"] = val
+                if detector_ref:
+                    detector_ref[0].trade_amount_usdc = val
+
+            if "take_profit_percent" in data:
+                val = float(data["take_profit_percent"])
+                trading_cfg["take_profit_percent"] = val
+                if detector_ref:
+                    detector_ref[0].take_profit = val
+
+            if "stop_loss_percent" in data:
+                val = float(data["stop_loss_percent"])
+                trading_cfg["stop_loss_percent"] = val
+                if detector_ref:
+                    detector_ref[0].stop_loss = val
+
+            if "mode" in data:
+                trading_cfg["mode"] = data["mode"]
+                if detector_ref:
+                    detector_ref[0].live_mode = data["mode"] == "live"
+                    trader.live_mode = data["mode"] == "live"
+
+            if "reversal_mode" in data:
+                trading_cfg["reversal_mode"] = data["reversal_mode"]
+                if detector_ref:
+                    detector_ref[0].reversal_mode = data["reversal_mode"]
+
+            if "double_bottom_enabled" in data:
+                val = bool(data["double_bottom_enabled"])
+                trading_cfg["double_bottom_enabled"] = val
+                if detector_ref:
+                    detector_ref[0].double_bottom_enabled = val
+
+            if "max_simultaneous_trades" in data:
+                val = int(data["max_simultaneous_trades"])
+                trading_cfg["max_simultaneous_trades"] = val
+                if detector_ref:
+                    detector_ref[0].max_simultaneous_trades = val
+
+            if "max_duration_hours" in data:
+                val = float(data["max_duration_hours"])
+                trading_cfg["max_duration_hours"] = val
+                if detector_ref:
+                    detector_ref[0].max_duration_hours = val
+
+            if "trading_pairs_limit" in data:
+                val = int(data["trading_pairs_limit"])
+                config["binance"]["top_pairs_count"] = val
+                if detector_ref:
+                    detector_ref[0].trading_pairs_limit = val
+                    if len(detector_ref) > 1:
+                        monitor = detector_ref[1]
+                        detector_ref[0].update_allowed_symbols(monitor.symbols)
+
+            if "pump_detection" in data:
+                val = bool(data["pump_detection"])
+                detection_cfg["pump_detection"] = val
+                if detector_ref:
+                    detector_ref[0].pump_detection = val
+
+            if "pump_threshold_percent" in data:
+                val = float(data["pump_threshold_percent"])
+                detection_cfg["pump_threshold_percent"] = val
+                if detector_ref:
+                    detector_ref[0].pump_threshold = val
+
+            if "pump_window_seconds" in data:
+                val = int(data["pump_window_seconds"])
+                detection_cfg["pump_window_seconds"] = val
+                if detector_ref:
+                    detector_ref[0].pump_window_sec = val
+
+            if "max_eur_trades" in data:
+                val = int(data["max_eur_trades"])
+                trading_cfg["max_eur_trades"] = val
+                if detector_ref:
+                    detector_ref[0].max_eur_trades = val
+
+            if "max_usdc_trades" in data:
+                val = int(data["max_usdc_trades"])
+                trading_cfg["max_usdc_trades"] = val
+                if detector_ref:
+                    detector_ref[0].max_usdc_trades = val
+
+            if "use_eur_convert" in data:
+                val = bool(data["use_eur_convert"])
+                trading_cfg["use_eur_convert"] = val
+                if hasattr(trader, 'use_eur_convert'):
+                    trader.use_eur_convert = val
+
+            if "use_usdc_spot" in data:
+                val = bool(data["use_usdc_spot"])
+                trading_cfg["use_usdc_spot"] = val
+                if hasattr(trader, 'use_usdc_spot'):
+                    trader.use_usdc_spot = val
+
+            # Save to config.json
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    full_config = json.load(f)
+                full_config["binance"] = config.get("binance", full_config.get("binance", {}))
+                full_config["detection"] = detection_cfg
+                full_config["trading"] = trading_cfg
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(full_config, f, indent=4, ensure_ascii=False)
+            except Exception as e:
+                logger.error(f"Failed to save config: {e}")
+
+            logger.info(f"Settings updated: threshold={detection_cfg.get('drop_threshold_percent')}%, "
+                        f"windows={detection_cfg.get('time_windows_minutes')}, "
+                        f"amount={trading_cfg.get('amount_per_trade_eur')}")
+
+            return jsonify({"success": True})
+
+        except Exception as e:
+            logger.error(f"Settings update error: {e}")
+            return jsonify({"success": False, "error": str(e)})
+
+    return app

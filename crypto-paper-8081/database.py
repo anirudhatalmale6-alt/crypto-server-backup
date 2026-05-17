@@ -1,0 +1,309 @@
+"""
+database.py - SQLite storage for crash events and simulated trades.
+"""
+
+import sqlite3
+import threading
+import time
+import os
+
+
+class Database:
+    """Thread-safe SQLite database for crash detection and paper trading."""
+
+    def __init__(self, db_path="crash_detector.db"):
+        self.db_path = db_path
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _get_conn(self):
+        """Get a thread-local database connection."""
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            self._local.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._local.conn.row_factory = sqlite3.Row
+            self._local.conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn.execute("PRAGMA synchronous=NORMAL")
+        return self._local.conn
+
+    def _init_db(self):
+        """Create tables if they don't exist."""
+        conn = self._get_conn()
+        with self._lock:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS crashes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    detected_at REAL NOT NULL,
+                    detected_at_str TEXT NOT NULL,
+                    price_start REAL NOT NULL,
+                    price_end REAL NOT NULL,
+                    drop_percent REAL NOT NULL,
+                    time_window_min INTEGER NOT NULL,
+                    window_seconds REAL NOT NULL,
+                    acknowledged INTEGER DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    crash_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL DEFAULT 'BUY',
+                    entry_price REAL NOT NULL,
+                    current_price REAL,
+                    quantity REAL NOT NULL,
+                    amount_eur REAL NOT NULL,
+                    entry_time REAL NOT NULL,
+                    entry_time_str TEXT NOT NULL,
+                    exit_price REAL,
+                    exit_time REAL,
+                    exit_time_str TEXT,
+                    status TEXT NOT NULL DEFAULT 'OPEN',
+                    pnl_eur REAL DEFAULT 0.0,
+                    pnl_percent REAL DEFAULT 0.0,
+                    is_live INTEGER DEFAULT 0,
+                    order_id TEXT,
+                    FOREIGN KEY (crash_id) REFERENCES crashes(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS price_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    timestamp REAL NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_crashes_symbol ON crashes(symbol);
+                CREATE INDEX IF NOT EXISTS idx_crashes_time ON crashes(detected_at);
+                CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
+                CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
+                CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_time ON price_snapshots(symbol, timestamp);
+            """)
+            conn.commit()
+
+    def record_crash(self, symbol, price_start, price_end, drop_percent,
+                     time_window_min, window_seconds):
+        """Record a detected crash event. Returns the crash ID."""
+        now = time.time()
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        conn = self._get_conn()
+        with self._lock:
+            cursor = conn.execute("""
+                INSERT INTO crashes
+                (symbol, detected_at, detected_at_str, price_start, price_end,
+                 drop_percent, time_window_min, window_seconds)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (symbol, now, now_str, price_start, price_end,
+                  drop_percent, time_window_min, window_seconds))
+            conn.commit()
+            return cursor.lastrowid
+
+    def record_trade(self, crash_id, symbol, entry_price, quantity, amount_eur,
+                     is_live=False, order_id=None, trade_method=None, tp_pct=None, sl_pct=None, max_dur_hours=None, trade_mode=None):
+        """Record a buy trade (paper or live). Returns the trade ID."""
+        now = time.time()
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        conn = self._get_conn()
+        with self._lock:
+            cursor = conn.execute("""
+                INSERT INTO trades
+                (crash_id, symbol, entry_price, current_price, quantity,
+                 amount_eur, entry_time, entry_time_str, status, is_live, order_id, trade_method, tp_pct, sl_pct, max_dur_hours, trade_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?)
+            """, (crash_id, symbol, entry_price, entry_price, quantity,
+                  amount_eur, now, now_str, 1 if is_live else 0, order_id, trade_method, tp_pct, sl_pct, max_dur_hours, trade_mode))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_trade_price(self, trade_id, current_price):
+        """Update current price and P&L for an open trade."""
+        conn = self._get_conn()
+        with self._lock:
+            row = conn.execute(
+                "SELECT entry_price, quantity, amount_eur FROM trades WHERE id=?",
+                (trade_id,)
+            ).fetchone()
+            if row:
+                entry_price = row["entry_price"]
+                quantity = row["quantity"]
+                amount_eur = row["amount_eur"]
+                pnl_percent = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                pnl_eur = amount_eur * (pnl_percent / 100)
+                conn.execute("""
+                    UPDATE trades
+                    SET current_price=?, pnl_eur=?, pnl_percent=?
+                    WHERE id=?
+                """, (current_price, pnl_eur, pnl_percent, trade_id))
+                conn.commit()
+
+    def update_trade_quantity(self, trade_id, new_quantity):
+        """Update quantity for an open trade (sync with Binance)."""
+        conn = self._get_conn()
+        with self._lock:
+            conn.execute("UPDATE trades SET quantity=? WHERE id=?", (new_quantity, trade_id))
+            conn.commit()
+
+    def close_trade(self, trade_id, exit_price, close_method=""):
+        """Close a trade at exit price."""
+        now = time.time()
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        conn = self._get_conn()
+        with self._lock:
+            row = conn.execute(
+                "SELECT entry_price, quantity, amount_eur FROM trades WHERE id=?",
+                (trade_id,)
+            ).fetchone()
+            if row:
+                entry_price = row["entry_price"]
+                quantity = row["quantity"]
+                amount_eur = row["amount_eur"]
+                pnl_percent = ((exit_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+                pnl_eur = amount_eur * (pnl_percent / 100)
+                conn.execute("""
+                    UPDATE trades
+                    SET current_price=?, exit_price=?, exit_time=?,
+                        exit_time_str=?, status='CLOSED', pnl_eur=?, pnl_percent=?,
+                        close_method=?
+                    WHERE id=?
+                """, (exit_price, exit_price, now, now_str,
+                      pnl_eur, pnl_percent, close_method, trade_id))
+                conn.commit()
+
+
+    def update_trade_tpsl(self, trade_id, tp_pct, sl_pct, active):
+        """Update individual TP/SL for a trade."""
+        conn = self._get_conn()
+        with self._lock:
+            conn.execute(
+                "UPDATE trades SET ind_tp_pct=?, ind_sl_pct=?, ind_active=? WHERE id=?",
+                (tp_pct, sl_pct, active, trade_id)
+            )
+            conn.commit()
+
+
+    def has_trade_for_crash(self, crash_id):
+        """Check if any trade (open or closed) exists for this crash_id."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM trades WHERE crash_id=?",
+            (crash_id,)
+        ).fetchone()
+        return row["cnt"] > 0
+
+    def was_manually_closed(self, symbol, hours=1):
+        """Check if symbol was manually closed within last N hours."""
+        conn = self._get_conn()
+        cutoff = time.time() - (hours * 3600)
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM trades WHERE symbol=? AND status='CLOSED' AND close_method='M' AND exit_time > ?",
+            (symbol, cutoff)
+        ).fetchone()
+        return row["cnt"] > 0
+
+    def get_trade(self, trade_id):
+        """Get a single trade by ID."""
+        conn = self._get_conn()
+        row = conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_open_trades(self):
+        """Get all open trades."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE status='OPEN' ORDER BY entry_time DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_closed_trades(self, limit=100):
+        """Get closed trades."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE status='CLOSED' ORDER BY exit_time DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_trades(self, limit=200):
+        """Get all trades ordered by entry time."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM trades ORDER BY entry_time DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_recent_crashes(self, limit=100):
+        """Get recent crash events."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM crashes ORDER BY detected_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_crash_count_24h(self):
+        """Get number of crashes in last 24 hours."""
+        cutoff = time.time() - 86400
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM crashes WHERE detected_at > ?",
+            (cutoff,)
+        ).fetchone()
+        return row["cnt"] if row else 0
+
+    def get_portfolio_summary(self):
+        """Get summary of all trading activity."""
+        conn = self._get_conn()
+        open_trades = conn.execute("""
+            SELECT COUNT(*) as count,
+                   COALESCE(SUM(amount_eur), 0) as total_invested,
+                   COALESCE(SUM(pnl_eur), 0) as unrealized_pnl
+            FROM trades WHERE status='OPEN'
+        """).fetchone()
+
+        closed_trades = conn.execute("""
+            SELECT COUNT(*) as count,
+                   COALESCE(SUM(pnl_eur), 0) as realized_pnl,
+                   COALESCE(SUM(CASE WHEN pnl_eur > 0 THEN 1 ELSE 0 END), 0) as wins,
+                   COALESCE(SUM(CASE WHEN pnl_eur <= 0 THEN 1 ELSE 0 END), 0) as losses
+            FROM trades WHERE status='CLOSED'
+        """).fetchone()
+
+        return {
+            "open_count": open_trades["count"],
+            "total_invested": open_trades["total_invested"],
+            "unrealized_pnl": open_trades["unrealized_pnl"],
+            "closed_count": closed_trades["count"],
+            "realized_pnl": closed_trades["realized_pnl"],
+            "wins": closed_trades["wins"],
+            "losses": closed_trades["losses"],
+            "win_rate": (closed_trades["wins"] / closed_trades["count"] * 100)
+                        if closed_trades["count"] > 0 else 0
+        }
+
+    def acknowledge_crash(self, crash_id):
+        """Mark a crash alert as acknowledged."""
+        conn = self._get_conn()
+        with self._lock:
+            conn.execute(
+                "UPDATE crashes SET acknowledged=1 WHERE id=?", (crash_id,)
+            )
+            conn.commit()
+
+    def get_unacknowledged_crashes(self):
+        """Get crashes that haven't been acknowledged."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM crashes WHERE acknowledged=0 ORDER BY detected_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def cleanup_old_snapshots(self, max_age_hours=24):
+        """Remove price snapshots older than max_age_hours."""
+        cutoff = time.time() - (max_age_hours * 3600)
+        conn = self._get_conn()
+        with self._lock:
+            conn.execute(
+                "DELETE FROM price_snapshots WHERE timestamp < ?", (cutoff,)
+            )
+            conn.commit()

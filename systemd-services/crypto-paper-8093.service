@@ -1,0 +1,14 @@
+[Unit]
+Description=Crypto Paper Trading 8093
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-paper-8093
+ExecStart=/opt/crypto-paper-8093/venv/bin/python /opt/crypto-paper-8093/main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

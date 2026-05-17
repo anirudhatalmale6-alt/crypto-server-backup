@@ -1,0 +1,15 @@
+[Unit]
+Description=Crypto Crash Detector (Full)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-alert
+ExecStart=/opt/crypto-alert/venv/bin/python3 main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/crypto-alert/crypto-alert.log
+StandardError=append:/opt/crypto-alert/crypto-alert.log
+
+[Install]
+WantedBy=multi-user.target

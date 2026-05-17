@@ -1,0 +1,62 @@
+{
+  "2026-05-06": {
+    "eur_max_simul": 0,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 0,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-07": {
+    "eur_max_simul": 0,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 0,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-08": {
+    "eur_max_simul": 0,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 0,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-09": {
+    "eur_max_simul": 0,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 0,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-10": {
+    "eur_max_simul": 0,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 0,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-11": {
+    "eur_max_simul": 0,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 0,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  }
+}

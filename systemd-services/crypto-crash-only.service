@@ -1,0 +1,15 @@
+[Unit]
+Description=Crypto Crash Detector (Crash Only)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-crash-only
+ExecStart=/opt/crypto-crash-only/venv/bin/python3 main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/crypto-crash-only/crash-only.log
+StandardError=append:/opt/crypto-crash-only/crash-only.log
+
+[Install]
+WantedBy=multi-user.target

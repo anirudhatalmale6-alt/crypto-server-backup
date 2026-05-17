@@ -1,0 +1,309 @@
+"""
+trader.py - Binance Convert API trading module for EU accounts.
+
+EU/MiCA regulation blocks USDT spot trading, so all buys and sells
+go through Binance Convert API: EUR -> COIN for buy, COIN -> EUR for sell.
+Large orders are automatically split into chunks of <=195 EUR (Convert API limit ~200 EUR).
+The DB/monitor expect prices in USDT terms, so we fetch USDT price after each convert.
+"""
+
+import hashlib
+import hmac
+import time
+import logging
+from typing import Optional
+from urllib.parse import urlencode
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+MAX_CONVERT_EUR = 195.0
+MIN_CONVERT_EUR = 5.0
+
+
+class BinanceTrader:
+    """Handles real order execution on Binance via Convert API (EUR pairs)."""
+
+    def __init__(self, config: dict):
+        trading_cfg = config.get("trading", {})
+        self.api_key = trading_cfg.get("binance_api_key", "")
+        self.api_secret = trading_cfg.get("binance_api_secret", "")
+        self.live_mode = trading_cfg.get("mode", "demo") == "live"
+        self.rest_url = config.get("binance", {}).get("rest_url", "https://api.binance.com")
+
+        if self.live_mode and (not self.api_key or self.api_key == "YOUR_API_KEY"):
+            logger.error("LIVE mode enabled but no valid Binance API key configured!")
+            logger.error("Falling back to DEMO mode for safety.")
+            self.live_mode = False
+
+        mode_str = "LIVE" if self.live_mode else "DEMO"
+        logger.info(f"Trading mode: {mode_str} (Convert API / EUR)")
+
+        self._exchange_info_cache = {}
+
+    def _sign(self, params: dict) -> dict:
+        params["timestamp"] = int(time.time() * 1000)
+        query_string = urlencode(params)
+        signature = hmac.new(
+            self.api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+        params["signature"] = signature
+        return params
+
+    def _headers(self) -> dict:
+        return {"X-MBX-APIKEY": self.api_key}
+
+    def _get_usdt_price(self, symbol: str) -> Optional[float]:
+        try:
+            resp = requests.get(
+                f"{self.rest_url}/api/v3/ticker/price",
+                params={"symbol": symbol},
+                timeout=10
+            )
+            resp.raise_for_status()
+            return float(resp.json()["price"])
+        except Exception as e:
+            logger.error(f"Failed to get USDT price for {symbol}: {e}")
+            return None
+
+    def _extract_asset(self, symbol: str) -> str:
+        for suffix in ("USDT", "BUSD", "USDC", "EUR"):
+            if symbol.endswith(suffix):
+                return symbol[:-len(suffix)]
+        return symbol
+
+    def get_account_balance(self, asset: str = "EUR") -> Optional[float]:
+        if not self.live_mode:
+            return None
+        try:
+            params = self._sign({})
+            resp = requests.get(
+                f"{self.rest_url}/api/v3/account",
+                params=params,
+                headers=self._headers(),
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for b in data.get("balances", []):
+                if b["asset"] == asset:
+                    return float(b["free"])
+        except Exception as e:
+            logger.error(f"Failed to get balance for {asset}: {e}")
+        return None
+
+    def _single_convert(self, from_asset: str, to_asset: str, amount: float) -> Optional[dict]:
+        """Execute a single Convert API call (getQuote + acceptQuote). Returns dict or None."""
+        if from_asset == "EUR":
+            amount_str = f"{amount:.2f}"
+        else:
+            amount_str = f"{amount:.8f}".rstrip("0").rstrip(".")
+
+        params = self._sign({
+            "fromAsset": from_asset,
+            "toAsset": to_asset,
+            "fromAmount": amount_str,
+        })
+        resp = requests.post(
+            f"{self.rest_url}/sapi/v1/convert/getQuote",
+            params=params,
+            headers=self._headers(),
+            timeout=15
+        )
+        resp.raise_for_status()
+        quote = resp.json()
+
+        quote_id = quote.get("quoteId")
+        if not quote_id:
+            logger.error(f"CONVERT: No quoteId for {amount_str} {from_asset} -> {to_asset}. Response: {quote}")
+            return None
+
+        to_amount = float(quote.get("toAmount", 0))
+        from_amount = float(quote.get("fromAmount", amount))
+
+        accept_params = self._sign({"quoteId": quote_id})
+        resp2 = requests.post(
+            f"{self.rest_url}/sapi/v1/convert/acceptQuote",
+            params=accept_params,
+            headers=self._headers(),
+            timeout=15
+        )
+        resp2.raise_for_status()
+        result = resp2.json()
+
+        status = result.get("orderStatus", "")
+        if status not in ("SUCCESS", "PROCESS", "ACCEPT_SUCCESS"):
+            logger.error(f"CONVERT: Acceptance failed. Status: {status}. Response: {result}")
+            return None
+
+        order_id = result.get("orderId", quote_id)
+        logger.info(f"CONVERT FILLED: {from_amount} {from_asset} -> {to_amount} {to_asset} [#{order_id}]")
+        return {
+            "order_id": order_id,
+            "from_amount": from_amount,
+            "to_amount": to_amount,
+            "status": status,
+        }
+
+    def market_buy(self, symbol: str, eur_amount: float) -> Optional[dict]:
+        """
+        Buy crypto using Binance Convert API (EUR -> asset).
+        Automatically chunks orders > 195 EUR into multiple Convert calls.
+        """
+        if not self.live_mode:
+            logger.info(f"DEMO: Would buy {symbol} for {eur_amount} EUR via Convert")
+            return None
+
+        asset = self._extract_asset(symbol)
+        logger.info(f"LIVE CONVERT BUY: {eur_amount} EUR -> {asset} (symbol: {symbol})")
+
+        if eur_amount < MIN_CONVERT_EUR:
+            logger.error(f"EUR amount {eur_amount:.2f} below minimum {MIN_CONVERT_EUR}")
+            return None
+
+        chunks = []
+        remaining = eur_amount
+        while remaining >= MIN_CONVERT_EUR:
+            chunk = min(remaining, MAX_CONVERT_EUR)
+            chunks.append(round(chunk, 2))
+            remaining -= chunk
+
+        total_coins = 0.0
+        total_eur = 0.0
+        last_order_id = None
+        last_status = None
+
+        for i, chunk_eur in enumerate(chunks):
+            logger.info(f"BUY chunk {i+1}/{len(chunks)}: {chunk_eur} EUR -> {asset}")
+            result = None
+            for attempt in range(3):
+                try:
+                    result = self._single_convert("EUR", asset, chunk_eur)
+                except Exception as e:
+                    logger.error(f"BUY chunk {i+1} attempt {attempt+1} exception: {e}")
+                    result = None
+                if result is not None:
+                    break
+                if attempt < 2:
+                    logger.info(f"BUY chunk {i+1}: retry {attempt+2}/3 in 2s...")
+                    time.sleep(2)
+
+            if result is None:
+                if total_coins > 0:
+                    logger.warning(f"Partial buy: {total_coins:.8g} {asset} from {total_eur:.2f} EUR ({i}/{len(chunks)} chunks)")
+                    break
+                return None
+
+            total_coins += result["to_amount"]
+            total_eur += result["from_amount"]
+            last_order_id = result["order_id"]
+            last_status = result["status"]
+
+            if i < len(chunks) - 1:
+                time.sleep(0.3)
+
+        usdt_price = self._get_usdt_price(symbol)
+        if usdt_price is None:
+            usdt_price = total_eur / total_coins if total_coins > 0 else 0
+
+        logger.info(
+            f"CONVERT BUY COMPLETE: {total_coins:.8g} {asset} for {total_eur:.2f} EUR "
+            f"({len(chunks)} chunks), USDT price: {usdt_price:.8g}"
+        )
+
+        return {
+            "order_id": last_order_id,
+            "symbol": symbol,
+            "side": "BUY",
+            "filled_qty": total_coins,
+            "filled_quote": total_eur,
+            "avg_price": usdt_price,
+            "status": last_status
+        }
+
+    def market_sell(self, symbol: str, quantity: float) -> Optional[dict]:
+        """
+        Sell crypto using Binance Convert API (asset -> EUR).
+        Automatically chunks large sells that would exceed the EUR limit.
+        """
+        if not self.live_mode:
+            logger.info(f"DEMO: Would sell {quantity} {symbol} via Convert")
+            return None
+
+        asset = self._extract_asset(symbol)
+        logger.info(f"LIVE CONVERT SELL: {quantity:.8g} {asset} -> EUR (symbol: {symbol})")
+
+        usdt_price = self._get_usdt_price(symbol)
+        eur_rate = self._get_usdt_price("EURUSDT") or 1.13
+
+        if usdt_price and eur_rate:
+            estimated_eur = quantity * usdt_price / eur_rate
+        else:
+            estimated_eur = MAX_CONVERT_EUR + 100
+
+        if estimated_eur <= MAX_CONVERT_EUR * 1.2:
+            chunks_qty = [quantity]
+        else:
+            coins_per_chunk = (MAX_CONVERT_EUR / estimated_eur) * quantity * 0.95
+            chunks_qty = []
+            remaining = quantity
+            while remaining > 0:
+                chunk = min(remaining, coins_per_chunk)
+                chunks_qty.append(chunk)
+                remaining -= chunk
+                if remaining < coins_per_chunk * 0.1:
+                    if remaining > 0:
+                        chunks_qty[-1] += remaining
+                    break
+
+        total_eur = 0.0
+        total_coins_sold = 0.0
+        last_order_id = None
+        last_status = None
+
+        for i, chunk_qty in enumerate(chunks_qty):
+            logger.info(f"SELL chunk {i+1}/{len(chunks_qty)}: {chunk_qty:.8g} {asset} -> EUR")
+            try:
+                result = self._single_convert(asset, "EUR", chunk_qty)
+            except Exception as e:
+                logger.error(f"SELL chunk {i+1} exception: {e}")
+                result = None
+
+            if result is None:
+                if total_coins_sold > 0:
+                    logger.warning(
+                        f"Partial sell: {total_coins_sold:.8g} {asset} for {total_eur:.2f} EUR "
+                        f"({i}/{len(chunks_qty)} chunks)"
+                    )
+                    break
+                return None
+
+            total_eur += result["to_amount"]
+            total_coins_sold += result["from_amount"]
+            last_order_id = result["order_id"]
+            last_status = result["status"]
+
+            if i < len(chunks_qty) - 1:
+                time.sleep(0.3)
+
+        if usdt_price is None:
+            usdt_price = total_eur / total_coins_sold if total_coins_sold > 0 else 0
+
+        logger.info(
+            f"CONVERT SELL COMPLETE: {total_coins_sold:.8g} {asset} for {total_eur:.2f} EUR "
+            f"({len(chunks_qty)} chunks), USDT price: {usdt_price:.8g}"
+        )
+
+        return {
+            "order_id": last_order_id,
+            "symbol": symbol,
+            "side": "SELL",
+            "filled_qty": total_coins_sold,
+            "filled_quote": total_eur,
+            "avg_price": usdt_price,
+            "eur_received": total_eur,
+            "status": last_status
+        }
