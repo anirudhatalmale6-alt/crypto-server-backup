@@ -1,0 +1,58 @@
+{
+  "binance": {
+    "rest_url": "https://api.binance.com",
+    "ws_url": "wss://stream.binance.com:9443/ws",
+    "top_pairs_count": 300,
+    "quote_asset": "USDT"
+  },
+  "detection": {
+    "drop_threshold_percent": 15.0,
+    "time_windows_minutes": [
+      60
+    ],
+    "price_check_interval_seconds": 1,
+    "pump_detection": false,
+    "pump_threshold_percent": 5.0,
+    "pump_window_seconds": 5
+  },
+  "alerts": {
+    "sound_enabled": false,
+    "sound_repeat": 3,
+    "telegram_enabled": false,
+    "telegram_bot_token": "YOUR_BOT_TOKEN_HERE",
+    "telegram_chat_id": "YOUR_CHAT_ID_HERE"
+  },
+  "trading": {
+    "enabled": true,
+    "mode": "demo",
+    "binance_api_key": "pSYSSq4D7GHN8yYlo6IzTkQYPDEJvIYyhJBGlZJ3OJ4ZbQuck44eX6lxrAcnoFpI",
+    "binance_api_secret": "Oco2EY918FezrYzj2OUxplVlrO3k7bkd2FnrtFUcGYMircrViabLOonsNjsMFPAM",
+    "amount_per_trade_eur": 10.0,
+    "take_profit_percent": 30.0,
+    "stop_loss_percent": 20.0,
+    "reversal_mode": "instant",
+    "reversal_window_seconds": 30,
+    "reversal_timeout_seconds": 300,
+    "max_duration_hours": 0.0,
+    "max_simultaneous_trades": 7,
+    "double_bottom_enabled": false,
+    "use_eur_convert": true,
+    "use_usdc_spot": true,
+    "max_eur_trades": 4,
+    "max_usdc_trades": 0,
+    "amount_per_trade_usdc": 500.0,
+    "binance_api_key_2": "tZrY9oTyxZL8BooPv8WJabkqG9fYAIN3RSqi4dOfT8F8IASpR23W5QM2DbwQFAnb",
+    "binance_api_secret_2": "PiOUGbMX61Ur76RPs853FlgKi84zfsP2CPJmfxexc7Mbo31vGpBBKkZ3lLrZc5yS"
+  },
+  "dashboard": {
+    "host": "0.0.0.0",
+    "port": 7081,
+    "debug": false,
+    "password": "guidoleb@@11",
+    "security_question": "What's the name of your cat?",
+    "security_answer": "gattosugarmiao"
+  },
+  "database": {
+    "path": "paper_7081.db"
+  }
+}

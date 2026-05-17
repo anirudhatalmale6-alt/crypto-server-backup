@@ -1,0 +1,8 @@
+[
+  {
+    "time": "2026-05-16 20:08:57",
+    "asset": "PHB",
+    "message": "USDC Spot sell failed -> sold via Convert EUR",
+    "error": "USDC spot sell failed: Market is closed."
+  }
+]

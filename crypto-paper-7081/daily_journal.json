@@ -1,0 +1,112 @@
+{
+  "2026-05-05": {
+    "eur_max_simul": 7,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 1,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-06": {
+    "eur_max_simul": 7,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 1,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-07": {
+    "eur_max_simul": 6,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 30,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 1,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 30,
+    "usdc_skip_error": 0
+  },
+  "2026-05-08": {
+    "eur_max_simul": 5,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 12,
+    "eur_skip_error": 3,
+    "usdc_max_simul": 3,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 12,
+    "usdc_skip_error": 0
+  },
+  "2026-05-10": {
+    "eur_max_simul": 3,
+    "eur_skip_limit": 11,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 1,
+    "usdc_skip_limit": 11,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-11": {
+    "eur_max_simul": 2,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 1,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-12": {
+    "eur_max_simul": 1,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 1,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-13": {
+    "eur_max_simul": 1,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 1,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-14": {
+    "eur_max_simul": 0,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 1,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-15": {
+    "eur_max_simul": 0,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 1,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  },
+  "2026-05-16": {
+    "eur_max_simul": 0,
+    "eur_skip_limit": 0,
+    "eur_skip_funds": 0,
+    "eur_skip_error": 0,
+    "usdc_max_simul": 1,
+    "usdc_skip_limit": 0,
+    "usdc_skip_funds": 0,
+    "usdc_skip_error": 0
+  }
+}

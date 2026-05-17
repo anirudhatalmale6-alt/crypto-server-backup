@@ -1,0 +1,17 @@
+{
+    "binance": {
+        "rest_url": "https://api.binance.com"
+    },
+    "trading": {
+        "binance_api_key": "pSYSSq4D7GHN8yYlo6IzTkQYPDEJvIYyhJBGlZJ3OJ4ZbQuck44eX6lxrAcnoFpI",
+        "binance_api_secret": "Oco2EY918FezrYzj2OUxplVlrO3k7bkd2FnrtFUcGYMircrViabLOonsNjsMFPAM",
+        "binance_api_key_2": "tZrY9oTyxZL8BooPv8WJabkqG9fYAIN3RSqi4dOfT8F8IASpR23W5QM2DbwQFAnb",
+        "binance_api_secret_2": "PiOUGbMX61Ur76RPs853FlgKi84zfsP2CPJmfxexc7Mbo31vGpBBKkZ3lLrZc5yS"
+    },
+    "dashboard": {
+        "port": 5065,
+        "password": "guidoleb@@11",
+        "security_question": "What's the name of your cat?",
+        "security_answer": "gattosugarmiao"
+    }
+}
