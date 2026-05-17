@@ -1,0 +1,14 @@
+[Unit]
+Description=PriceCompare Web Dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/price-compare
+ExecStart=/usr/bin/python3 /opt/price-compare/price_compare.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Shared Binance Cache Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-shared
+ExecStart=/opt/crypto-paper-7081/venv/bin/python /opt/crypto-shared/binance_shared_cache.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

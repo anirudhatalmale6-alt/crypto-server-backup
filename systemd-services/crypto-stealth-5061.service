@@ -1,0 +1,15 @@
+[Unit]
+Description=Crypto Stealth TP/SL Manager
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-stealth-5061
+ExecStart=/opt/crypto-stealth-5061/venv/bin/python3 stealth_tpsl.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/crypto-stealth-5061/stealth.log
+StandardError=append:/opt/crypto-stealth-5061/stealth.log
+
+[Install]
+WantedBy=multi-user.target

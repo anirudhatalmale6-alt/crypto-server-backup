@@ -1,0 +1,14 @@
+[Unit]
+Description=Crypto Demo Trading 9003 (USDC Volume Pump - Demo Test)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-paper-9003
+ExecStart=/opt/crypto-paper-9003/venv/bin/python /opt/crypto-paper-9003/main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

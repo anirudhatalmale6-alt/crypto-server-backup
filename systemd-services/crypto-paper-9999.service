@@ -1,0 +1,13 @@
+[Unit]
+Description=Crypto Paper Trading - Comparison Dashboard (Port 9999)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-paper-9999
+ExecStart=/opt/crypto-paper-9999/venv/bin/python3 /opt/crypto-paper-9999/dashboard.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

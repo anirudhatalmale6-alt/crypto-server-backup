@@ -1,0 +1,14 @@
+[Unit]
+Description=Crypto Demo Trading 9002 (Sentinel Pump - Manual Close)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-paper-9002
+ExecStart=/opt/crypto-paper-9002/venv/bin/python main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
